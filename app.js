@@ -12,7 +12,7 @@ const pick = a => a[Math.floor(Math.random() * a.length)];
 const rand = (a, b) => a + Math.random() * (b - a);
 const shuffle = a => { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 // Screen state lives up here because the voice loader can run before the rest of the file.
 const SCREENS = {};
 let cur = null, sessionStart = null, lastInput = 0;
@@ -38,15 +38,20 @@ function openDB() {
   return new Promise((res, rej) => {
     const r = indexedDB.open('littleworld', 1);
     r.onupgradeneeded = () => { r.result.createObjectStore('kv'); r.result.createObjectStore('blobs'); };
-    r.onsuccess = () => { db = r.result; res(); };
+    r.onsuccess = () => { db = r.result; db.onclose = () => { db = null; }; res(); };
     r.onerror = () => rej(r.error);
   });
 }
-function tx(store, mode, fn) {
+function tx1(store, mode, fn) {
   return new Promise((res, rej) => {
     const t = db.transaction(store, mode); const r = fn(t.objectStore(store));
-    t.oncomplete = () => res(r && r.result); t.onerror = () => rej(t.error);
+    t.oncomplete = () => res(r && r.result); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error('aborted'));
   });
+}
+// iPhones sometimes drop the storage connection after the app was in the background: reopen once and retry.
+async function tx(store, mode, fn) {
+  try { if (!db) await openDB(); return await tx1(store, mode, fn); }
+  catch (e) { if (e && e.name === 'QuotaExceededError') throw e; await openDB(); return tx1(store, mode, fn); }
 }
 const kvGet = k => tx('kv', 'readonly', s => s.get(k));
 const kvSet = (k, v) => tx('kv', 'readwrite', s => s.put(v, k));
@@ -98,12 +103,32 @@ const save = () => kvSet('settings', S);
 const herName = () => S.name || 'sweetheart';
 
 // ---------------- sound ----------------
-let AC, sfxUntil = 0;
+let AC, sfxUntil = 0, audioUnlocked = false;
 function ac() {
   if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
-  if (AC.state === 'suspended') AC.resume();
+  if (AC.state !== 'running' && AC.state !== 'closed') AC.resume().catch(() => {});
   return AC;
 }
+// iPhone and iPad only allow sound after a real tap (touchend/click), and mute web sound when the
+// silent switch is on unless the page says it is "playback" audio. Do both on every tap until sound
+// is running (iOS can also pause sound after a call or when the app was in the background).
+function setAudioSession(type) { try { if (navigator.audioSession) navigator.audioSession.type = type; } catch (e) {} }
+function unlockAudio() {
+  if (!micStream) setAudioSession('playback');
+  const a = ac();
+  try { const b = a.createBuffer(1, 1, 22050), src = a.createBufferSource(); src.buffer = b; src.connect(a.destination); src.start(0); } catch (e) {}
+  if (!audioUnlocked && window.speechSynthesis) {
+    try { const u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); } catch (e) {}
+  }
+  if (a.state === 'running') audioUnlocked = true;
+}
+for (const ev of ['touchend', 'click', 'keydown', 'pointerup']) {
+  document.addEventListener(ev, () => { if (!audioUnlocked || !AC || AC.state !== 'running') unlockAudio(); }, { capture: true, passive: true });
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { if (typeof ear !== 'undefined') ear.stop(); return; } // give the microphone back while away
+  if (AC) { audioUnlocked = false; ac(); }
+});
 function tone(freq, dur = 0.25, type = 'sine', vol = 0.25) {
   const a = ac(), o = a.createOscillator(), g = a.createGain();
   o.type = type; o.frequency.value = freq;
@@ -133,7 +158,9 @@ function loadVoices() {
   const had = voices.length;
   voices = window.speechSynthesis ? speechSynthesis.getVoices() : [];
   // Chrome lists voices a moment after start-up; refresh the voice picker if it was already showing.
-  if (!had && voices.length && cur && cur.name === 'grown') go('grown');
+  const sel = !had && voices.length && document.getElementById('robot-voice');
+  if (sel) { sel.innerHTML = ''; sel.append(h('option', { value: '' }, `Automatic (${(pickVoiceAuto() || {}).name || 'default'})`),
+    ...niceVoices().map(v => h('option', { value: v.name, selected: v.name === S.voice }, `${v.name}${v.localService ? '' : ' (internet)'}`))); }
 }
 if (window.speechSynthesis) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
 // Joke voices that come with macOS; never offer these.
@@ -155,13 +182,15 @@ function pickVoiceAuto() {
 function robotTTS(text, pitch = 1) {
   return new Promise(res => {
     if (!window.speechSynthesis || !text) return res();
-    stopVoice(); speechSynthesis.cancel();
+    stopVoice();
+    const wasBusy = speechSynthesis.speaking || speechSynthesis.pending;
+    speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text), v = pickVoice();
     if (v) { u.voice = v; u.lang = v.lang; }
     u.rate = 0.9; u.pitch = pitch;
     let done = false; const fin = () => { if (!done) { done = true; res(); } };
     u.onend = fin; u.onerror = fin; setTimeout(fin, 4500);
-    speechSynthesis.speak(u);
+    if (wasBusy) setTimeout(() => speechSynthesis.speak(u), 60); else speechSynthesis.speak(u);
   });
 }
 
@@ -197,7 +226,7 @@ function trimSilence(b) {
 }
 function clipBuf(key) {
   if (!bufCache[key]) bufCache[key] = fetch(`voice/${voiceName}/${VOICE[key]}`).then(r => r.arrayBuffer())
-    .then(ab => ac().decodeAudioData(ab)).then(trimSilence).catch(() => { delete bufCache[key]; return null; });
+    .then(decodeAudio).then(trimSilence).catch(() => { delete bufCache[key]; return null; });
   return bufCache[key];
 }
 // Finds clips covering the whole sentence, longest phrases first. Null if any part has no clip.
@@ -217,21 +246,28 @@ function stopVoice() {
   for (const src of voiceSources) { try { src.stop(); } catch (e) {} }
   voiceSources = [];
 }
-async function playClips(keys) {
-  const gen = ++voiceGen;
-  const bufs = await Promise.all(keys.map(clipBuf));
-  if (gen !== voiceGen) return true; // something newer started speaking
-  if (bufs.some(b => !b)) return false;
-  const a = ac(); let t = a.currentTime + 0.03;
+// Plays decoded sounds one after another through Web Audio (the path iPhone/iPad handle reliably).
+async function playBuffers(bufs, rate = 1, gap = 0.06) {
+  stopVoice();
+  const gen = voiceGen, a = ac();
+  if (a.state !== 'running') { await Promise.race([a.resume().catch(() => {}), wait(300)]); if (gen !== voiceGen) return true; }
+  let t = a.currentTime + 0.03;
   for (const b of bufs) {
-    const src = a.createBufferSource(); src.buffer = b; src.connect(a.destination); src.start(t);
+    const src = a.createBufferSource(); src.buffer = b; src.playbackRate.value = rate; src.connect(a.destination); src.start(t);
     voiceSources.push(src); src.onended = () => { voiceSources = voiceSources.filter(x => x !== src); };
-    t += b.duration + 0.06;
+    t += b.duration / rate + gap;
   }
   const end = Date.now() + (t - a.currentTime) * 1000;
   voiceUntil = end;
   await new Promise(r => { const tick = () => (gen !== voiceGen || Date.now() >= end) ? r() : setTimeout(tick, 40); tick(); });
   return true;
+}
+async function playClips(keys) {
+  const gen = ++voiceGen;
+  const bufs = await Promise.all(keys.map(clipBuf));
+  if (gen !== voiceGen) return true; // something newer started speaking
+  if (bufs.some(b => !b)) return false;
+  return playBuffers(bufs);
 }
 // Everything Pip says goes through here: natural clips when we have them, the computer voice otherwise.
 async function tts(text, pitch = 1) {
@@ -239,19 +275,38 @@ async function tts(text, pitch = 1) {
   await voiceReady;
   const plan = clipPlan(text);
   if (plan) {
-    if (curAudio) curAudio.pause();
     if (window.speechSynthesis) speechSynthesis.cancel();
-    stopVoice();
     if (await playClips(plan)) return;
   }
   return robotTTS(text, pitch);
 }
+// Family recordings and her own voice: decoded and played through Web Audio too.
+const decoded = new Map();
+function decodeAudio(ab) {
+  const a = ac();
+  return new Promise((res, rej) => { const p = a.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); });
+}
+async function playURL(url, rate = 1) {
+  if (!url) return false;
+  try {
+    let buf = decoded.get(url);
+    if (!buf) {
+      const gen = ++voiceGen;
+      buf = await decodeAudio(await (await fetch(url)).arrayBuffer());
+      if (gen !== voiceGen) return true;
+      decoded.set(url, buf); if (decoded.size > 40) decoded.delete(decoded.keys().next().value);
+    }
+    if (window.speechSynthesis) speechSynthesis.cancel();
+    return await playBuffers([buf], rate, 0);
+  } catch (e) {
+    return playElement(url, rate); // e.g. a recording format this device can't decode
+  }
+}
 let curAudio = null;
-function playURL(url, rate = 1) {
+function playElement(url, rate = 1) {
   return new Promise(res => {
-    if (!url) return res(false);
-    if (curAudio) curAudio.pause();
     stopVoice();
+    if (curAudio) curAudio.pause();
     const a = new Audio(url); curAudio = a;
     if (rate !== 1) { a.preservesPitch = false; a.playbackRate = rate; }
     let done = false; const fin = v => { if (!done) { done = true; res(v); } };
@@ -303,7 +358,10 @@ function thingDeck() {
 let micStream = null;
 async function getMic() {
   if (micStream && micStream.active) return micStream;
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  setAudioSession('play-and-record');
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) { setAudioSession('playback'); throw e; }
   return micStream;
 }
 // Turns captured sound into a small WAV file, made louder so a quiet little voice plays back clearly.
@@ -325,14 +383,16 @@ function toWav(chunks, rate) {
 const ear = {
   ready: false, level: 0, floor: 0.01, pre: [], job: null, rate: 48000, starting: null,
   start() {
-    if (this.ready) return Promise.resolve(true);
+    if (this.ready && micStream && micStream.active) return Promise.resolve(true);
+    if (this.ready) this.stop(); // the microphone died (e.g. the iPhone app went to the background)
     if (!this.starting) this.starting = (async () => {
       try {
         const st = await getMic(), a = ac(); this.rate = a.sampleRate;
         const src = a.createMediaStreamSource(st), node = a.createScriptProcessor(2048, 1, 1), mute = a.createGain();
         mute.gain.value = 0; src.connect(node); node.connect(mute).connect(a.destination);
         node.onaudioprocess = e => this.frame(e.inputBuffer.getChannelData(0));
-        this.node = node; this.ready = true; return true;
+        st.getAudioTracks().forEach(tr => { tr.onended = () => this.stop(); });
+        this.node = node; this.src = src; this.ready = true; return true;
       } catch (e) { this.starting = null; return false; }
     })();
     // Don't let a game wait forever if Chrome is still asking for microphone permission.
@@ -351,8 +411,8 @@ const ear = {
     // Ignore our own voices and sounds, and the clatter of her hitting keys.
     const blocked = appTalking() || Date.now() - lastInput < 400;
     if (!j.cap) {
-      if (blocked) { j.on = 0; return; }
       if (Date.now() > j.deadline) return this.finish(null);
+      if (blocked) { j.on = 0; return; }
       j.on = loud ? j.on + 1 : 0;
       if (j.on >= 3) { j.cap = this.pre.slice(); j.voiced = j.on * ms; j.quiet = 0; j.len = j.cap.length * ms; }
     } else {
@@ -365,14 +425,25 @@ const ear = {
       }
     }
   },
-  finish(chunks) { const j = this.job; this.job = null; if (j) j.resolve(chunks && chunks.length ? toWav(chunks, this.rate) : null); },
+  finish(chunks) { const j = this.job; this.job = null; if (j) { clearTimeout(j.timer); j.resolve(chunks && chunks.length ? toWav(chunks, this.rate) : null); } },
   // Resolves with a WAV of what she said, or null if she stayed quiet.
   listen({ wait: w = 6000, maxLen = 5000, silence = 800 } = {}) {
     this.cancel();
     if (!this.ready) return Promise.resolve(null);
-    return new Promise(resolve => { this.job = { resolve, deadline: Date.now() + w, maxLen, silence, on: 0, cap: null }; });
+    return new Promise(resolve => {
+      const j = this.job = { resolve, deadline: Date.now() + w, maxLen, silence, on: 0, cap: null };
+      // Safety net: give up even if the microphone stops sending sound (screen lock, phone call...).
+      j.timer = setTimeout(() => { if (this.job === j) this.finish(j.cap); }, w + maxLen + 1500);
+    });
   },
-  cancel() { if (this.job) { const j = this.job; this.job = null; j.resolve(null); } },
+  cancel() { if (this.job) { const j = this.job; this.job = null; clearTimeout(j.timer); j.resolve(null); } },
+  stop() {
+    this.cancel();
+    try { if (this.node) { this.node.onaudioprocess = null; this.node.disconnect(); } if (this.src) this.src.disconnect(); } catch (e) {}
+    if (micStream) micStream.getTracks().forEach(tr => tr.stop());
+    micStream = null; this.node = this.src = null; this.ready = false; this.starting = null; this.level = 0; this.pre = [];
+    setAudioSession('playback');
+  },
 };
 const micOK = async () => S.listen && await ear.start();
 // Plays back what she said; keeps it as a keepsake if the grown-ups chose to.
@@ -423,7 +494,7 @@ function pipMood(p, mood, ms) {
 })();
 // After a picture appears, Pip listens for a moment and cheers if she says anything.
 async function invite(pip, t, alive, w = 4000) {
-  if (!S.listen || !ear.ready) return false;
+  if (!(await micOK()) || !alive()) return false;
   pipMood(pip, 'listening');
   const heard = await ear.listen({ wait: w });
   if (!alive()) return false;
@@ -480,9 +551,13 @@ function bdayInfo() {
 }
 
 // ---------------- screen manager ----------------
+let screenGen = 0;
+// Runs spoken steps one after another, stopping if the screen changes (so old speech can't talk over a new game).
+async function chain(...steps) { const g = screenGen; for (const step of steps) { if (g !== screenGen) return; await step(); } }
 function go(name, ...args) {
   if (cur && cur.cleanup) { try { cur.cleanup(); } catch (e) {} }
-  stopSound(); ear.cancel();
+  screenGen++; stopSound(); ear.cancel();
+  if (name === 'grown' || name === 'goodnight') ear.stop(); // free the microphone when nobody is playing
   const root = $('#app'); root.innerHTML = '';
   cur = SCREENS[name](...args) || {}; cur.name = name;
   if (!document.title.startsWith('LW-ERR')) document.title = 'Little World · ' + name;
@@ -535,13 +610,13 @@ SCREENS.splash = () => {
     const bi = bdayInfo();
     go(bi && bi.isToday ? 'birthday' : 'home', true);
   };
-  el.addEventListener('pointerdown', start);
+  el.addEventListener('click', start);
   return { el, onKey: start };
 };
 
 SCREENS.home = (greet) => {
   const games = [['talk', 'pip', 'Talk with Pip'], ['songs', '🎵', 'Songs'], ['copy', '🦜', 'Copy me!'], ['peekaboo', '🙈', 'Peekaboo'], ['hiding', '🌳', "Who's hiding?"],
-    ['words', '🗣️', 'My Words'], ['numbers', '🔢', 'Counting'], ['paint', '🎨', 'Paint'], ['bubbles', '🫧', 'Bubbles'], ['piano', '🐮', 'Animals']];
+    ['words', '🗣️', 'My Words'], ['colours', '🌈', 'Colours'], ['numbers', '🔢', 'Counting'], ['paint', '🎨', 'Paint'], ['bubbles', '🫧', 'Bubbles'], ['piano', '🐮', 'Animals']];
   const bi = bdayInfo();
   if (bi && bi.days <= 30) games.unshift(['birthday', '🎂', bi.isToday ? 'Birthday!' : 'Birthday']);
   const tiles = games.map(([id, ic, label], i) => h('button', { class: 'tile', style: `background:${COLORS[i % COLORS.length]};animation-delay:${i * 60}ms`, onclick: () => go(id) },
@@ -551,7 +626,7 @@ SCREENS.home = (greet) => {
     bi && !bi.isToday && bi.days <= 30 ? h('div', { class: 'countdown' }, `🎂 ${bi.days} more ${bi.days === 1 ? 'sleep' : 'sleeps'} until ${herName()} turns ${bi.age}!`) : null,
     h('div', { class: 'tiles' }, tiles));
   (async () => { header.append(await faceEl(), h('h1', {}, `${S.name ? S.name + "'s" : 'Little'} World`)); })();
-  if (greet) (async () => { await tts('Hello'); await sayName(); })();
+  if (greet) chain(() => tts('Hello'), sayName);
   let sel = -1, lastSay = 0;
   function key(e) {
     if ((e.key === 'Enter' || e.key === ' ') && sel >= 0) return go(games[sel][0]);
@@ -589,7 +664,7 @@ SCREENS.talk = () => {
       if (t.self) await tts('Can you say your name?'); else await sayAround('Can you say', t, '?');
       if (!go_on()) continue;
       let heard = null;
-      if (mic) { pipMood(pip, 'listening'); heard = await ear.listen({ wait: 6000 }); pipMood(pip, null); }
+      if (mic && await micOK()) { pipMood(pip, 'listening'); heard = await ear.listen({ wait: 6000 }); pipMood(pip, null); }
       else await wait(3000);
       if (!go_on()) continue;
       if (heard) {
@@ -625,7 +700,7 @@ SCREENS.copy = () => {
     pipMood(pip, 'wave', 2000); await tts("Say something! I'll copy you!");
     while (alive) {
       pipMood(pip, 'listening'); msg.textContent = 'Say something! 👂';
-      const heard = await ear.listen({ wait: 20000, maxLen: 4000, silence: 700 });
+      const heard = (await micOK()) ? await ear.listen({ wait: 20000, maxLen: 4000, silence: 700 }) : (await wait(4000), null);
       if (!alive) return;
       pipMood(pip, null);
       if (!heard) { await tts(pick(['Say something!', 'Hello? Talk to me!', 'Can you sing?'])); continue; }
@@ -817,91 +892,175 @@ SCREENS.numbers = () => {
   return { el, onKey: () => { sparkle(); add(); }, cleanup() { alive = false; } };
 };
 
+// ---------------- colours ----------------
+// Taught like a teacher: show it, name it, name it with a thing, invite her, wait, praise or say it again.
+const COLOURS = [
+  ['red', '#fa5252', [['🍎', 'apple'], ['🚗', 'car']]], ['yellow', '#fcc419', [['🍌', 'banana'], ['☀️', 'sun']]],
+  ['blue', '#339af0', [['🐟', 'fish'], ['💧', 'water']]], ['green', '#40c057', [['🐸', 'frog'], ['🌳', 'tree']]],
+  ['orange', '#fd7e14', [['🥕', 'carrot']]], ['purple', '#845ef7', [['🍇', 'grapes']]], ['pink', '#f783ac', [['🐷', 'pig']]],
+];
+SCREENS.colours = () => {
+  const splash = h('div', { class: 'colour-splash' }), word = h('div', { class: 'colour-word' }), things = h('div', { class: 'colour-things' });
+  const pip = pipEl('side');
+  const el = h('div', { class: 'screen colours' }, splash, homeBtn(), things, word, pip, h('div', { class: 'hint' }, 'Tap for a new colour'));
+  let order = [], i = 0, lesson = 0, alive = true, lastNext = 0;
+  const cap = s => s[0].toUpperCase() + s.slice(1);
+  function next() {
+    if (Date.now() - lastNext < 1500) return; // key-mashing can't skip faster than she can hear
+    lastNext = Date.now(); stopSound(); ear.cancel(); pipMood(pip, null);
+    if (i >= order.length) { order = shuffle(COLOURS); i = 0; }
+    const [name, hex, objs] = order[i++];
+    // the new colour washes over the screen from the middle
+    el.style.background = splash.style.background || '#fff';
+    splash.style.background = hex; splash.classList.remove('go'); void splash.offsetWidth; splash.classList.add('go');
+    word.textContent = cap(name); word.style.color = hex; word.classList.remove('pop'); void word.offsetWidth; word.classList.add('pop');
+    const [emoji, thing] = pick(objs);
+    things.innerHTML = ''; things.append(h('span', {}, emoji)); things.classList.remove('pop'); void things.offsetWidth; things.classList.add('pop');
+    sfx.whoosh();
+    teach(name, thing, ++lesson);
+  }
+  async function teach(name, thing, me) {
+    const still = () => alive && me === lesson;
+    await wait(350); if (!still()) return;
+    await tts(`Look! ${cap(name)}!`); if (!still()) return;
+    await wait(250); await tts(`${cap(name)} ${thing}!`); if (!still()) return;
+    await wait(400); pipMood(pip, 'wave', 1200);
+    await tts(`${pick(['Say it with me.', 'Your turn!', 'Can you say'])} ${name}!`); if (!still()) return;
+    let heard = null;
+    if (await micOK()) { if (!still()) return; pipMood(pip, 'listening'); heard = await ear.listen({ wait: 4500 }); if (!still()) return; pipMood(pip, null); }
+    else await wait(2500);
+    if (!still()) return;
+    if (heard) { pipMood(pip, 'happy', 2400); sfx.tada(); confetti(50); keepHer(heard, name); await tts(`Yes! ${cap(name)}!`); }
+    else await tts(`${cap(name)}!`);
+  }
+  el.addEventListener('pointerdown', e => { sparkle(e.clientX, e.clientY); next(); });
+  next();
+  return { el, onKey: () => { sparkle(); next(); }, cleanup() { alive = false; } };
+};
+
 // ---------------- songs ----------------
-// Traditional nursery songs (public domain). Each line: words | notes (name:beats) | picture.
+// Traditional nursery songs (public domain), written in exact bars so they keep a steady beat.
+// Each line: words | notes (name:beats, R = rest) | picture | chords (name:beats) | optional sound Pip says.
 // "word-" joins to the next syllable; "{name}" is her name; "~" holds the previous word over another note.
+// The notes and the chords of every line add up to the same number of beats.
 const NOTE_I = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
-const noteHz = n => { const m = /^([A-G])([#b]?)(\d)$/.exec(n); const midi = 12 * (+m[3] + 1) + NOTE_I[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0); return 440 * 2 ** ((midi - 69) / 12); };
+const noteMidi = n => { const m = /^([A-G])([#b]?)(\d)$/.exec(n); return 12 * (+m[3] + 1) + NOTE_I[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0); };
+const midiHz = m => 440 * 2 ** ((m - 69) / 12);
+const noteHz = n => midiHz(noteMidi(n));
+const CHORDS = { C: ['C', 0], F: ['F', 0], G: ['G', 0], D: ['D', 0], Am: ['A', 1] }; // root, minor?
+const beatsOf = b => (b ? (b.includes('/') ? b.split('/')[0] / b.split('/')[1] : +b) : 1);
 const MAC_ANIMALS = [['cow', 'moo', '🐄'], ['duck', 'quack', '🦆'], ['dog', 'woof', '🐶']];
+const MAC_FARM = 'Old Mac- Don- ald had a farm,|G4 G4 G4 D4 E4 E4 D4:2|👨‍🌾|G:2 G:2 C:2 G:2';
+const MAC_EIEIO = pic => `E- I- E- I- O!|B4 B4 A4 A4 G4:4|${pic}|G:2 D:2 G:4`;
 const SONGS = [
-  { id: 'twinkle', title: 'Twinkle Twinkle', say: 'Twinkle Twinkle', icon: '⭐', bpm: 96, lines: [
-    'Twin- kle twin- kle lit- tle star,|C4 C4 G4 G4 A4 A4 G4:2|⭐',
-    'How I won- der what you are!|F4 F4 E4 E4 D4 D4 C4:2|✨',
-    'Up a- bove the world so high,|G4 G4 F4 F4 E4 E4 D4:2|🌙',
-    'Like a dia- mond in the sky!|G4 G4 F4 F4 E4 E4 D4:2|💎',
-    'Twin- kle twin- kle lit- tle star,|C4 C4 G4 G4 A4 A4 G4:2|⭐',
-    'How I won- der what you are!|F4 F4 E4 E4 D4 D4 C4:2|✨'] },
-  { id: 'mac', title: 'Old MacDonald', say: 'Old MacDonald', icon: '🐄', bpm: 120, lines: MAC_ANIMALS.flatMap(([a, s, pic]) => [
-    'Old Mac- Don- ald had a farm,|G4 G4 G4 D4 E4 E4 D4:2|👨‍🌾',
-    'E- I- E- I- O!|B4 B4 A4 A4 G4:3|👨‍🌾',
-    `And on his farm he had a ${a},|D4 G4 G4 G4 D4 E4 E4 D4:2|${pic}`,
-    `E- I- E- I- O!|B4 B4 A4 A4 G4:3|${pic}|${s}`,
-    `With a ${s} ${s} here,|D4:0.5 D4:0.5 G4 G4 G4:2|${pic}`,
-    `And a ${s} ${s} there,|D4:0.5 D4:0.5 G4 G4 G4:2|${pic}`,
-    `Here a ${s}, there a ${s}, ev- ery- where a ${s} ${s}!|G4:0.5 G4:0.5 G4 G4:0.5 G4:0.5 G4 G4:0.5 G4:0.5 G4:0.5 G4:0.5 G4 G4|${pic}`,
-    'Old Mac- Don- ald had a farm,|G4 G4 G4 D4 E4 E4 D4:2|👨‍🌾',
-    `E- I- E- I- O!|B4 B4 A4 A4 G4:3|${pic}|${s}`]) },
-  { id: 'spider', title: 'Itsy Bitsy Spider', say: 'Itsy Bitsy Spider', icon: '🕷️', bpm: 112, lines: [
-    'The it- sy bit- sy spi- der climbed up the wa- ter spout.|G4:0.5 C5 C5:0.5 C5 D5:0.5 E5 E5:0.5 E5 D5:0.5 C5 D5:0.5 E5 C5:2|🕷️⬆️',
-    'Down came the rain and washed the spi- der out!|E5:1.5 E5:0.5 F5 G5:2 G5 F5:0.5 E5 F5:0.5 G5 E5:2|🌧️',
-    'Out came the sun and dried up all the rain,|C5:1.5 C5:0.5 D5 E5:2 E5 D5:0.5 C5 D5:0.5 E5 C5:2|☀️',
-    'And the it- sy bit- sy spi- der climbed up the spout a- gain!|G4:0.5 G4:0.5 C5 C5:0.5 C5 D5:0.5 E5 E5:0.5 E5 D5:0.5 C5 D5:0.5 E5 C5:2|🕷️⬆️'] },
-  { id: 'boat', title: 'Row Your Boat', say: 'Row Your Boat', icon: '🚣', bpm: 100, lines: [
-    'Row, row, row your boat,|C4:1.5 C4:1.5 C4 D4:0.5 E4:1.5|🚣',
-    'Gent- ly down the stream.|E4 D4:0.5 E4 F4:0.5 G4:3|🌊',
-    'Mer- ri- ly mer- ri- ly mer- ri- ly mer- ri- ly,|C5:0.5 C5:0.5 C5:0.5 G4:0.5 G4:0.5 G4:0.5 E4:0.5 E4:0.5 E4:0.5 C4:0.5 C4:0.5 C4:0.5|😄',
-    'Life is but a dream!|G4 F4:0.5 E4 D4:0.5 C4:3|💤'] },
-  { id: 'where', title: 'Where is {name}?', say: '', icon: '🙈', bpm: 100, name: true, lines: [
-    'Where is {name} ~ Where is {name} ~|C4 D4 E4 C4 C4 D4 E4 C4|🙈',
-    'Here you are! Here you are!|E4 F4 G4:2 E4 F4 G4:2|FACE',
-    'How are you to- day, {name}?|G4:0.5 A4:0.5 G4:0.5 F4:0.5 E4 C4|FACE',
-    'Ve- ry well, I thank you!|G4:0.5 A4:0.5 G4:0.5 F4:0.5 E4 C4|😊',
-    'Peek- a- boo! Peek- a- boo!|C4 G3 C4:2 C4 G3 C4:2|🙈FACE'] },
-  { id: 'bday', title: 'Happy Birthday', say: 'Happy birthday', icon: '🎂', bpm: 104, name: true, lines: [
-    'Hap- py birth- day to you,|G4:0.75 G4:0.25 A4 G4 C5 B4:2|🎂',
-    'Hap- py birth- day to you,|G4:0.75 G4:0.25 A4 G4 D5 C5:2|🎈',
-    'Hap- py birth- day dear {name} ~|G4:0.75 G4:0.25 G5 E5 C5 B4 A4:2|FACE',
-    'Hap- py birth- day to you!|F5:0.75 F5:0.25 E5 C5 D5 C5:2|🎉'] },
+  { id: 'twinkle', title: 'Twinkle Twinkle', say: 'Twinkle Twinkle', icon: '⭐', bpm: 104, meter: 4, lines: [
+    'Twin- kle twin- kle lit- tle star,|C4 C4 G4 G4 A4 A4 G4:2|⭐|C:2 C:2 F:2 C:2',
+    'How I won- der what you are!|F4 F4 E4 E4 D4 D4 C4:2|✨|F:2 C:2 G:2 C:2',
+    'Up a- bove the world so high,|G4 G4 F4 F4 E4 E4 D4:2|🌙|C:2 F:2 C:2 G:2',
+    'Like a dia- mond in the sky!|G4 G4 F4 F4 E4 E4 D4:2|💎|C:2 F:2 C:2 G:2',
+    'Twin- kle twin- kle lit- tle star,|C4 C4 G4 G4 A4 A4 G4:2|⭐|C:2 C:2 F:2 C:2',
+    'How I won- der what you are!|F4 F4 E4 E4 D4 D4 C4:2|✨|F:2 C:2 G:2 C:2'] },
+  { id: 'mac', title: 'Old MacDonald', say: 'Old MacDonald', icon: '🐄', bpm: 126, meter: 4, lines: MAC_ANIMALS.flatMap(([a, s, pic]) => {
+    const S2 = s[0].toUpperCase() + s.slice(1);
+    return [MAC_FARM, MAC_EIEIO('👨‍🌾'),
+      `And on his farm he had a ${a},|D4:0.5 G4:0.5 G4 G4 D4 E4 E4 D4:2|${pic}|G:2 G:2 C:2 G:2`,
+      MAC_EIEIO(pic),
+      `${S2} ${s}!|R:2 R:2|${pic}|G:2 D:2|${s} ${s}`,
+      `With a ${s} ${s} here, and a ${s} ${s} there,|D4:0.5 D4:0.5 G4 G4 G4 D4:0.5 D4:0.5 G4 G4 G4|${pic}|G:4 G:4`,
+      `Here a ${s}, there a ${s}, ev- ery- where a ${s} ${s}!|G4:0.5 G4:0.5 G4 G4:0.5 G4:0.5 G4 G4:0.5 G4:0.5 G4:0.5 G4:0.5 G4 G4|${pic}|G:4 D:2 G:2`,
+      MAC_FARM, MAC_EIEIO(pic)];
+  }) },
+  { id: 'spider', title: 'Itsy Bitsy Spider', say: 'Itsy Bitsy Spider', icon: '🕷️', bpm: 100, meter: 4, lines: [
+    'The it- sy bit- sy spi- der climbed up the wa- ter spout.|G4:0.5 C5:0.5 C5:0.5 C5:0.5 D5:0.5 E5 E5:0.5 E5:0.5 D5:0.5 C5:0.5 D5:0.5 E5:0.5 C5:1.5|🕷️⬆️|C:4 G:2 C:2',
+    'Down came the rain and washed the spi- der out!|E5 E5:0.5 F5:0.5 G5:2 G5:0.5 F5:0.5 E5:0.5 F5:0.5 G5:0.5 E5:1.5|🌧️|C:2 F:2 G:2 C:2',
+    'Out came the sun and dried up all the rain,|C5 C5:0.5 D5:0.5 E5:2 E5:0.5 D5:0.5 C5:0.5 D5:0.5 E5:0.5 C5:1.5|☀️|C:4 G:2 C:2',
+    'And the it- sy bit- sy spi- der climbed up the spout a- gain!|G4:0.5 G4:0.5 C5:0.5 C5:0.5 C5:0.5 D5:0.5 E5:0.5 E5:0.5 E5:0.5 D5:0.5 C5:0.5 D5 E5:0.5 C5|🕷️⬆️|C:4 G:2 C:2'] },
+  { id: 'boat', title: 'Row Your Boat', say: 'Row Your Boat', icon: '🚣', bpm: 96, meter: 4, lines: [0, 1].flatMap(() => [
+    'Row, row, row your boat,|C4 C4 C4:0.75 D4:0.25 E4|🚣|C:4',
+    'Gent- ly down the stream.|E4:0.75 D4:0.25 E4:0.75 F4:0.25 G4:2|🌊|C:4',
+    'Mer- ri- ly mer- ri- ly mer- ri- ly mer- ri- ly,|C5:1/3 C5:1/3 C5:1/3 G4:1/3 G4:1/3 G4:1/3 E4:1/3 E4:1/3 E4:1/3 C4:1/3 C4:1/3 C4:1/3|😄|C:2 G:2',
+    'Life is but a dream!|G4:0.75 F4:0.25 E4:0.75 D4:0.25 C4:2|💤|G:2 C:2']) },
+  { id: 'where', title: 'Where is {name}?', say: '', icon: '🙈', bpm: 100, meter: 4, name: true, lines: [
+    'Where is {name}? ~ Where is {name}? ~|C4 D4 E4 C4 C4 D4 E4 C4|🙈|C:4 C:4',
+    'Here you are! Here you are!|E4 F4 G4:2 E4 F4 G4:2|FACE|C:4 C:4',
+    'How are you to- day, {name}?|G4:0.5 A4:0.5 G4:0.5 F4:0.5 E4 C4|FACE|C:4',
+    'Ve- ry well, I thank you!|G4:0.5 A4:0.5 G4:0.5 F4:0.5 E4 C4|😊|C:4',
+    'Peek- a- boo! Peek- a- boo!|C4 G3 C4:2 C4 G3 C4:2|🙈FACE|C:2 G:2 C:4'] },
+  { id: 'bday', title: 'Happy Birthday', say: 'Happy birthday', icon: '🎂', bpm: 108, meter: 3, name: true, lines: [
+    'Hap- py birth- day to you,|G4:0.75 G4:0.25 A4 G4 C5 B4:2|🎂|C:1 C:3 G:2',
+    'Hap- py birth- day to you,|G4:0.75 G4:0.25 A4 G4 D5 C5:2|🎈|G:1 G:3 C:2',
+    'Hap- py birth- day dear {name} ~|G4:0.75 G4:0.25 G5 E5 C5 B4 A4|FACE|C:1 C:3 F:2',
+    'Hap- py birth- day to you!|F5:0.75 F5:0.25 E5 C5 D5 C5:2|🎉|F:1 C:2 G:1 C:2'] },
 ];
 function parseLine(str) {
-  const [words, notes, pic, sound] = str.split('|');
+  const [words, notes, pic, chords, sound] = str.split('|');
   const toks = words.split(' '), ns = notes.split(' ');
-  if (toks.length !== ns.length) console.warn('song line mismatch', words);
-  return { pic, sound, notes: ns.map((n, i) => { const [nm, b] = n.split(':'); return { hz: noteHz(nm), beats: b ? +b : 1, tok: toks[i] || '~' }; }) };
+  return {
+    pic, sound,
+    notes: ns.map((n, i) => { const [nm, b] = n.split(':'); return { hz: nm === 'R' ? 0 : noteHz(nm), beats: beatsOf(b), tok: toks[i] || '~' }; }),
+    chords: (chords || '').split(' ').filter(Boolean).map(c => { const [nm, b] = c.split(':'); return { nm, beats: beatsOf(b) }; }),
+  };
 }
-// A soft music-box sound for each note, plus a gentle shaker on the beat.
+// A soft music-box melody, a bass note and chords on the beat, and a shaker: a little band.
 function bell(t, hz, dur, vol = 0.2) {
   const a = ac(), g = a.createGain(), o1 = a.createOscillator(), o2 = a.createOscillator(), g2 = a.createGain();
   o1.type = 'triangle'; o1.frequency.value = hz; o2.type = 'sine'; o2.frequency.value = hz * 2; g2.gain.value = 0.25;
-  g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(vol, t + 0.015); g.gain.exponentialRampToValueAtTime(0.001, t + Math.max(0.3, dur * 0.95));
+  g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(vol, t + 0.012); g.gain.exponentialRampToValueAtTime(0.001, t + Math.max(0.25, dur * 0.95));
   o1.connect(g); o2.connect(g2).connect(g); g.connect(a.destination);
   o1.start(t); o2.start(t); o1.stop(t + dur + 0.1); o2.stop(t + dur + 0.1);
   return [o1, o2];
 }
+function pluck(t, hz, dur, vol, type = 'sine') {
+  const a = ac(), o = a.createOscillator(), g = a.createGain();
+  o.type = type; o.frequency.value = hz;
+  g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(vol, t + 0.01); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(a.destination); o.start(t); o.stop(t + dur + 0.05);
+  return [o];
+}
+function thump(t, vol = 0.35) { // a soft kick drum on the strong beats
+  const a = ac(), o = a.createOscillator(), g = a.createGain();
+  o.frequency.setValueAtTime(140, t); o.frequency.exponentialRampToValueAtTime(50, t + 0.15);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+  o.connect(g).connect(a.destination); o.start(t); o.stop(t + 0.25);
+  return [o];
+}
 let noiseBuf = null;
-function shaker(t, vol = 0.05) {
+function shaker(t, vol = 0.04) {
   const a = ac();
-  if (!noiseBuf) { noiseBuf = a.createBuffer(1, a.sampleRate * 0.08, a.sampleRate); const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length); }
+  if (!noiseBuf) { noiseBuf = a.createBuffer(1, Math.floor(a.sampleRate * 0.08), a.sampleRate); const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length); }
   const s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
   s.buffer = noiseBuf; f.type = 'highpass'; f.frequency.value = 5000; g.gain.value = vol;
   s.connect(f).connect(g).connect(a.destination); s.start(t);
   return [s];
+}
+// Plays one chord for `beats` beats: bass + kick on the first beat of each bar, soft chord on the others.
+function backing(t, chord, beats, beat, meter, barPos) {
+  const [root, minor] = CHORDS[chord] || CHORDS.C, r = noteMidi(root + '3'), out = [];
+  const triad = [r + 12, r + 12 + (minor ? 3 : 4), r + 12 + 7];
+  for (let k = 0; k < Math.round(beats); k++) {
+    const at = t + k * beat, strong = (barPos + k) % meter === 0;
+    if (k === 0 || strong) { out.push(...pluck(at, midiHz(r - 12), beat * 0.9, 0.22, 'triangle')); }
+    if (strong) out.push(...thump(at));
+    else triad.forEach(m => out.push(...pluck(at, midiHz(m), beat * 0.45, 0.045, 'triangle')));
+  }
+  return out;
 }
 const PENTA = ['C5', 'D5', 'E5', 'G5', 'A5', 'C6'].map(noteHz);
 
 SCREENS.songs = () => {
   const pip = pipEl('side'), stage = h('div', { class: 'song-stage' });
   const el = h('div', { class: 'screen songs' }, sky(), homeBtn(), stage, pip);
-  let alive = true, playing = false, nodes = [], timers = [], nextIdx = 0, sel = -1;
+  let alive = true, playing = false, nodes = [], timers = [], nextIdx = 0;
   const list = () => SONGS.filter(s => s.id !== 'bday' || (bdayInfo() && bdayInfo().days <= 30));
-  function stopSong() { for (const n of nodes) { try { n.stop(); } catch (e) {} } nodes = []; timers.forEach(clearTimeout); timers = []; playing = false; }
+  const later = (fn, ms) => timers.push(setTimeout(() => alive && fn(), Math.max(0, ms)));
+  function stopSong() { for (const n of nodes) { try { n.stop(); } catch (e) {} } nodes = []; timers.forEach(clearTimeout); timers = []; playing = false; voiceUntil = 0; }
   function picker() {
-    stopSong(); pipMood(pip, null); sel = -1;
+    stopSong(); pipMood(pip, null);
     const songs = list();
     stage.innerHTML = '';
     stage.append(h('div', { class: 'song-grid' }, songs.map((s, i) => h('button', {
       class: 'song-card', style: `background:${COLORS[(i + 2) % COLORS.length]}`,
-      onpointerdown: e => { e.stopPropagation(); play(s); },
+      onclick: e => { e.stopPropagation(); play(s); },
     }, h('span', { class: 'ic' }, s.icon), s.title.replace('{name}', herName())))));
   }
   async function play(song) {
@@ -909,59 +1068,60 @@ SCREENS.songs = () => {
     const lines = song.lines.map(parseLine);
     const scene = h('div', { class: 'song-scene' }), lyric = h('div', { class: 'lyric' });
     stage.innerHTML = ''; stage.append(scene, lyric);
+    scene.textContent = song.icon;
     pipMood(pip, 'wave', 1500);
     if (song.name) { await tts("Let's sing!"); if (!alive || !playing) return; await sayName(); }
     else await tts(`Let's sing! ${song.say}!`);
+    const face = await faceEl();
     if (!alive || !playing) return;
     pipMood(pip, 'dance');
-    const face = await faceEl(); if (!alive || !playing) return;
-    const a = ac(), beat = 60 / song.bpm;
-    let t = a.currentTime + 0.4;
+    const a = ac(), beat = 60 / song.bpm, ms = at => (at - a.currentTime) * 1000;
+    let t = a.currentTime + 0.3, barPos = 0;
+    // count-in: one bar of shaker clicks so everyone feels the beat
+    for (let k = 0; k < song.meter; k++) { nodes.push(...shaker(t, k === 0 ? 0.09 : 0.06), ...pluck(t, k === 0 ? 1568 : 1175, 0.08, 0.06)); t += beat; }
     lines.forEach((line, li) => {
       const lineStart = t;
-      // show the line's words and picture as it starts
-      timers.push(setTimeout(() => {
-        if (!alive) return;
+      later(() => {
         lyric.innerHTML = '';
         line.notes.forEach(n => {
           if (n.tok === '~') return;
-          const txt = n.tok.replace('{name}', herName()).replace(/-$/, '');
-          n.span = h('span', { class: 'syl' + (n.tok.endsWith('-') ? ' join' : '') }, txt);
+          n.span = h('span', { class: 'syl' + (n.tok.endsWith('-') ? ' join' : '') }, n.tok.replace('{name}', herName()).replace(/-$/, ''));
           lyric.append(n.span);
         });
         scene.innerHTML = '';
         for (const part of line.pic.split(/(FACE)/).filter(Boolean)) scene.append(part === 'FACE' ? face.cloneNode(true) : h('span', {}, part));
         scene.className = 'song-scene ' + song.id + ' l' + li;
         scene.classList.remove('pop'); void scene.offsetWidth; scene.classList.add('pop');
-      }, (lineStart - a.currentTime) * 1000 - 60));
+        if (line.sound) { pipMood(pip, 'happy', 1500); tts(line.sound + '!'); }
+      }, ms(lineStart) - 80);
+      // the band
+      let ct = lineStart, cb = barPos;
+      for (const c of line.chords) { nodes.push(...backing(ct, c.nm, c.beats, beat, song.meter, cb)); ct += c.beats * beat; cb = (cb + c.beats) % song.meter; }
+      // the tune, with the words lighting up in time
+      let lastSpan = null;
       line.notes.forEach(n => {
         const dur = n.beats * beat, at = t;
-        nodes.push(...bell(at, n.hz, dur));
-        timers.push(setTimeout(() => {
-          if (!alive) return;
-          voiceUntil = Date.now() + dur * 850; // Pip "sings" each note
-          const sp = n.span || line.notes.slice(0, line.notes.indexOf(n)).reverse().find(x => x.span)?.span;
+        if (n.hz) nodes.push(...bell(at, n.hz, dur));
+        later(() => {
+          const sp = n.span || lastSpan; if (n.span) lastSpan = n.span;
           lyric.querySelectorAll('.syl.on').forEach(x => x.classList.remove('on'));
           if (sp) sp.classList.add('on');
+          if (n.hz && !line.sound) voiceUntil = Date.now() + dur * 850; // Pip sings each note
           if (ear.level > 0.06 && Math.random() < 0.5) sparkle();
-        }, (at - a.currentTime) * 1000));
+        }, ms(at));
         t += dur;
       });
-      for (let b = lineStart; b < t - 0.01; b += beat) nodes.push(...shaker(b));
-      if (line.sound) { const at = t; timers.push(setTimeout(() => alive && tts(line.sound[0].toUpperCase() + line.sound.slice(1) + ' ' + line.sound + '!'), (at - a.currentTime) * 1000)); t += beat * 1.5; }
-      t += beat * 0.5; // a little breath between lines
+      for (let b = lineStart; b < t - 0.01; b += beat / 2) nodes.push(...shaker(b, Math.abs(((b - lineStart) / beat) % 1) < 0.01 ? 0.045 : 0.025));
+      barPos = (barPos + Math.round((t - lineStart) / beat)) % song.meter;
     });
-    timers.push(setTimeout(async () => {
-      if (!alive) return;
+    later(async () => {
       playing = false; lyric.innerHTML = ''; pipMood(pip, 'happy', 2500); sfx.tada(); confetti(80);
       await tts(pick(['Lovely singing!', 'Yay!', 'Well done!']));
-      if (alive && !playing) setTimeout(() => alive && !playing && picker(), 1200);
-    }, (t - a.currentTime) * 1000 + 200));
+      setTimeout(() => alive && !playing && picker(), 1200);
+    }, ms(t) + 300);
   }
   function key() {
-    if (playing) { // she plays along with bells
-      const hz = pick(PENTA); nodes.push(...bell(ac().currentTime, hz, 0.4, 0.12)); sparkle(); return;
-    }
+    if (playing) { nodes.push(...bell(ac().currentTime, pick(PENTA), 0.4, 0.12)); sparkle(); return; } // she plays along
     const songs = list(); play(songs[nextIdx % songs.length]);
   }
   picker();
@@ -1057,7 +1217,8 @@ SCREENS.piano = () => {
       lastSay = Date.now(); sound = !sound;
       const name = ANIMALS[i][1], w = S.words.find(x => x.en.toLowerCase() === name.toLowerCase());
       // Alternate the animal's name and its sound: "Cow" ... "Moo!"
-      setTimeout(() => (sound ? tts(SOUNDS[name.toLowerCase()], 1.15) : w ? sayWord(w) : tts(name)), 350);
+      const g = screenGen;
+      setTimeout(() => g === screenGen && (sound ? tts(SOUNDS[name.toLowerCase()], 1.15) : w ? sayWord(w) : tts(name)), 350);
     }
   }
   const row = 'asdfghjk';
@@ -1084,7 +1245,7 @@ SCREENS.birthday = () => {
     partying = true; sfx.tada(); confetti(120); setTimeout(() => alive && confetti(120), 1000);
     await wait(700);
     if (S.bdayRec.length) { for (const id of S.bdayRec) { if (!alive) return; await playBlob(id); await wait(300); } }
-    else { await tts('Happy birthday'); await sayName(); await tts(`You are ${NUM_WORDS[n]}!`); }
+    else await chain(() => tts('Happy birthday'), sayName, () => tts(`You are ${NUM_WORDS[n]}!`));
     await wait(1500);
     if (alive) { flames.forEach(f => f.classList.remove('out')); partying = false; }
   }
@@ -1094,7 +1255,7 @@ SCREENS.birthday = () => {
     raf = requestAnimationFrame(loop);
   }
   micOK().then(ok => ok && alive && loop());
-  (async () => { await tts('Happy birthday'); await sayName(); await tts("Let's blow out the candles!"); })();
+  chain(() => tts('Happy birthday'), sayName, () => tts("Let's blow out the candles!"));
   return { el, onKey: blowOne, cleanup() { alive = false; cancelAnimationFrame(raf); } };
 };
 
@@ -1102,7 +1263,7 @@ SCREENS.goodnight = () => {
   const pip = pipEl('big sleep');
   const el = h('div', { class: 'screen goodnight' }, h('div', { class: 'zz' }, 'z z z'), pip,
     h('h1', {}, 'All done for now!'), h('p', {}, 'Night night 🌙  Pip is sleeping'));
-  (async () => { await tts('All done for now'); await sayName(); await tts('Night night!'); })();
+  chain(() => tts('All done for now'), sayName, () => tts('Night night!'));
   return { el, onKey: () => {} };
 };
 
@@ -1153,7 +1314,7 @@ function allBlobIds() {
   return ids.filter(Boolean);
 }
 const blobToDataURL = b => new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(b); });
-function download(blob, name) { const a = h('a', { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove(); }
+function download(blob, name) { const u = URL.createObjectURL(blob), a = h('a', { href: u, download: name }); document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 60000); }
 
 SCREENS.grown = () => {
   const el = h('div', { class: 'screen grown' });
@@ -1262,7 +1423,7 @@ SCREENS.grown = () => {
       h('section', {}, h('h2', {}, '🗣️ Backup computer voice'),
         h('p', { class: 'sub' }, "Pip speaks with a natural recorded voice. This computer voice is only used for words you add yourself and haven't recorded. Your own recordings always play first."),
         h('div', { class: 'row' },
-          h('select', { onchange: async e => { S.voice = e.target.value; await save(); sample(); } },
+          h('select', { id: 'robot-voice', onchange: async e => { S.voice = e.target.value; await save(); sample(); } },
             h('option', { value: '' }, `Automatic (${(pickVoiceAuto() || {}).name || 'default'})`),
             niceVoices().map(v => h('option', { value: v.name, selected: v.name === S.voice }, `${v.name}${v.localService ? '' : ' (internet)'}`))),
           h('button', { onclick: sample }, '🔊 Try it'))),
@@ -1328,7 +1489,7 @@ async function smoke() {
   const out = [];
   window.addEventListener('error', e => out.push('ERR ' + e.message));
   window.addEventListener('unhandledrejection', e => out.push('REJ ' + (e.reason && e.reason.message)));
-  for (const s of ['grown', 'splash', 'home', 'talk', 'copy', 'peekaboo', 'hiding', 'words', 'numbers', 'songs', 'paint', 'bubbles', 'piano', 'birthday', 'goodnight']) {
+  for (const s of ['grown', 'splash', 'home', 'talk', 'copy', 'peekaboo', 'hiding', 'words', 'colours', 'numbers', 'songs', 'paint', 'bubbles', 'piano', 'birthday', 'goodnight']) {
     try {
       go(s); await wait(400);
       for (let i = 0; i < 3; i++) { if (cur.onKey) cur.onKey({ key: 'asd'[i] }); await wait(1500); }

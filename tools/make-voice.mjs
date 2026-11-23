@@ -32,6 +32,8 @@ const PHRASES = [
   'Happy birthday!', "Let's blow out the candles!", 'You are', 'All done for now.', 'Night night!',
   // home screen buttons
   'Talk with Pip', 'Copy me', 'My Words', 'Counting', 'Paint', 'Bubbles', 'Animals', 'Birthday',
+  // colours
+  'Colours', 'Red!', 'Yellow!', 'Blue!', 'Green!', 'Orange!', 'Purple!', 'Pink!', 'Carrot!', 'Grapes!', 'Pig!', 'Tree!', 'What colour is it?',
   // songs
   'Songs', "Let's sing!", 'Lovely singing!', 'Yay!', 'Twinkle Twinkle', 'Old MacDonald', 'Itsy Bitsy Spider', 'Row Your Boat',
   // starter words
