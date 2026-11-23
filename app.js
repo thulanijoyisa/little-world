@@ -83,7 +83,7 @@ function defaults() {
   return {
     name: '', photo: null, birthday: '', nameRec: [], bdayRec: [], minutes: 15, listen: true, voice: '',
     words: STARTER.map(([en, emoji]) => ({ id: uid(), en, emoji, photo: null, rec: { en: [] } })),
-    herClips: [], keepVoice: true, countTo: 5, setupDone: false,
+    herClips: [], keepVoice: true, countTo: 5, pipVoice: 'matilda', setupDone: false,
   };
 }
 // Older saves had isiZulu fields; keep only what the English app uses.
@@ -151,10 +151,11 @@ function pickVoiceAuto() {
   for (const re of PREFER) { const v = nice.find(v => re.test(v.name)); if (v) return v; }
   return nice[0];
 }
-function tts(text, pitch = 1) {
+// The computer's own voice: only a last resort now (e.g. a word a family typed but never recorded).
+function robotTTS(text, pitch = 1) {
   return new Promise(res => {
     if (!window.speechSynthesis || !text) return res();
-    speechSynthesis.cancel();
+    stopVoice(); speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text), v = pickVoice();
     if (v) { u.voice = v; u.lang = v.lang; }
     u.rate = 0.9; u.pitch = pitch;
@@ -163,11 +164,94 @@ function tts(text, pitch = 1) {
     speechSynthesis.speak(u);
   });
 }
+
+// ---------------- Pip's natural voice (recorded clips in voice/) ----------------
+// voice/index.json maps a phrase ("where's", "duck", "quack quack") to its audio file.
+// Sentences are built from clips: "Where's Duck?" plays "where's" then "duck".
+const norm = s => String(s).toLowerCase().replace(/’/g, "'").replace(/[^a-z0-9' ]+/g, ' ').replace(/\s+/g, ' ').trim();
+const PIP_VOICES = [['matilda', 'Matilda', 'warm and friendly'], ['jessica', 'Jessica', 'bright and playful'],
+  ['lily', 'Lily', 'soft, British accent'], ['sarah', 'Sarah', 'gentle and soft']];
+let VOICE = {}, voiceName = '', voiceReady = Promise.resolve(), bufCache = {};
+// Loads the chosen voice's list of clips, then quietly downloads them all so they also work offline.
+function loadVoice(name) {
+  if (!PIP_VOICES.some(v => v[0] === name)) name = PIP_VOICES[0][0];
+  if (name === voiceName) return voiceReady;
+  voiceName = name; bufCache = {}; VOICE = {};
+  voiceReady = fetch(`voice/${name}/index.json`).then(r => r.ok ? r.json() : {}).then(j => {
+    if (voiceName !== name) return;
+    VOICE = j || {};
+    setTimeout(() => Object.values(VOICE).forEach(f => fetch(`voice/${name}/${f}`).catch(() => {})), 3000);
+  }).catch(() => {});
+  return voiceReady;
+}
+function trimSilence(b) {
+  const d = b.getChannelData(0), thr = 0.012;
+  let st = 0, en = d.length - 1;
+  while (st < en && Math.abs(d[st]) < thr) st++;
+  while (en > st && Math.abs(d[en]) < thr) en--;
+  const pad = Math.floor(b.sampleRate * 0.03);
+  st = Math.max(0, st - pad); en = Math.min(d.length - 1, en + pad);
+  const out = ac().createBuffer(b.numberOfChannels, en - st + 1, b.sampleRate);
+  for (let c = 0; c < b.numberOfChannels; c++) out.copyToChannel(b.getChannelData(c).subarray(st, en + 1), c);
+  return out;
+}
+function clipBuf(key) {
+  if (!bufCache[key]) bufCache[key] = fetch(`voice/${voiceName}/${VOICE[key]}`).then(r => r.arrayBuffer())
+    .then(ab => ac().decodeAudioData(ab)).then(trimSilence).catch(() => { delete bufCache[key]; return null; });
+  return bufCache[key];
+}
+// Finds clips covering the whole sentence, longest phrases first. Null if any part has no clip.
+function clipPlan(text) {
+  const toks = norm(text).split(' ').filter(Boolean), keys = [];
+  for (let i = 0; i < toks.length;) {
+    let n = Math.min(7, toks.length - i);
+    for (; n > 0; n--) { const k = toks.slice(i, i + n).join(' '); if (VOICE[k]) { keys.push(k); break; } }
+    if (!n) return null;
+    i += n;
+  }
+  return keys.length ? keys : null;
+}
+let voiceSources = [], voiceUntil = 0, voiceGen = 0;
+function stopVoice() {
+  voiceGen++; voiceUntil = 0;
+  for (const src of voiceSources) { try { src.stop(); } catch (e) {} }
+  voiceSources = [];
+}
+async function playClips(keys) {
+  const gen = ++voiceGen;
+  const bufs = await Promise.all(keys.map(clipBuf));
+  if (gen !== voiceGen) return true; // something newer started speaking
+  if (bufs.some(b => !b)) return false;
+  const a = ac(); let t = a.currentTime + 0.03;
+  for (const b of bufs) {
+    const src = a.createBufferSource(); src.buffer = b; src.connect(a.destination); src.start(t);
+    voiceSources.push(src); src.onended = () => { voiceSources = voiceSources.filter(x => x !== src); };
+    t += b.duration + 0.06;
+  }
+  const end = Date.now() + (t - a.currentTime) * 1000;
+  voiceUntil = end;
+  await new Promise(r => { const tick = () => (gen !== voiceGen || Date.now() >= end) ? r() : setTimeout(tick, 40); tick(); });
+  return true;
+}
+// Everything Pip says goes through here: natural clips when we have them, the computer voice otherwise.
+async function tts(text, pitch = 1) {
+  if (!text) return;
+  await voiceReady;
+  const plan = clipPlan(text);
+  if (plan) {
+    if (curAudio) curAudio.pause();
+    if (window.speechSynthesis) speechSynthesis.cancel();
+    stopVoice();
+    if (await playClips(plan)) return;
+  }
+  return robotTTS(text, pitch);
+}
 let curAudio = null;
 function playURL(url, rate = 1) {
   return new Promise(res => {
     if (!url) return res(false);
     if (curAudio) curAudio.pause();
+    stopVoice();
     const a = new Audio(url); curAudio = a;
     if (rate !== 1) { a.preservesPitch = false; a.playbackRate = rate; }
     let done = false; const fin = v => { if (!done) { done = true; res(v); } };
@@ -176,8 +260,8 @@ function playURL(url, rate = 1) {
   });
 }
 async function playBlob(id, rate) { return playURL(await blobURL(id), rate); }
-function stopSound() { if (curAudio) curAudio.pause(); if (window.speechSynthesis) speechSynthesis.cancel(); }
-const speaking = () => (curAudio && !curAudio.paused && !curAudio.ended) || (window.speechSynthesis && speechSynthesis.speaking);
+function stopSound() { stopVoice(); if (curAudio) curAudio.pause(); if (window.speechSynthesis) speechSynthesis.cancel(); }
+const speaking = () => Date.now() < voiceUntil || (curAudio && !curAudio.paused && !curAudio.ended) || (window.speechSynthesis && speechSynthesis.speaking);
 function appTalking() { return speaking() || Date.now() < sfxUntil; }
 async function sayWord(w) {
   const recs = w.rec.en;
@@ -499,7 +583,7 @@ SCREENS.talk = () => {
       const t = next();
       card.innerHTML = ''; card.append(await thingPic(t)); card.classList.remove('pop'); void card.offsetWidth; card.classList.add('pop');
       label.textContent = thingName(t);
-      if (t.self) { await tts('Look! It is'); if (go_on()) await sayName(); } else await sayWithSound('Look!', t);
+      if (t.self) { await tts("Look! It's"); if (go_on()) await sayName(); } else await sayWithSound('Look!', t);
       if (!go_on()) continue;
       await wait(300);
       if (t.self) await tts('Can you say your name?'); else await sayAround('Can you say', t, '?');
@@ -586,7 +670,7 @@ SCREENS.peekaboo = () => {
     label.textContent = thingName(thing); label.classList.remove('pop'); void label.offsetWidth; label.classList.add('pop');
     await wait(450); if (!alive) return;
     await tts('Peekaboo!');
-    if (thing.self) { await tts('There you are,'); await sayName(); } else await sayWithSound("There's", thing);
+    if (thing.self) { await tts('There you are!'); await sayName(); } else await sayWithSound("There's", thing);
     busy = false;
     invite(pip, thing, isAlive, 3500);
   }
@@ -847,7 +931,7 @@ SCREENS.birthday = () => {
     partying = true; sfx.tada(); confetti(120); setTimeout(() => alive && confetti(120), 1000);
     await wait(700);
     if (S.bdayRec.length) { for (const id of S.bdayRec) { if (!alive) return; await playBlob(id); await wait(300); } }
-    else { await tts('Happy birthday'); await sayName(); await tts(`You are ${n}!`); }
+    else { await tts('Happy birthday'); await sayName(); await tts(`You are ${NUM_WORDS[n]}!`); }
     await wait(1500);
     if (alive) { flames.forEach(f => f.classList.remove('out')); partying = false; }
   }
@@ -964,7 +1048,7 @@ SCREENS.grown = () => {
     const herRecs = h('div', { class: 'recs' }, S.herClips.slice().reverse().map(c => recChip(`${c.word} · ${c.date}`, c.id, async () => { S.herClips = S.herClips.filter(x => x.id !== c.id); await save(); rerender(); })));
     const rows = []; for (const w of S.words) rows.push(await wordRow(w));
     const importInp = h('input', { type: 'file', accept: 'application/json,.json', style: 'display:none', onchange: e => importAll(e.target.files[0]) });
-    const sample = () => tts(`Hello ${herName()}! Where's the duck? Peekaboo! Quack quack!`);
+    const sample = () => robotTTS("Hello! Where's the duck? Peekaboo! Quack quack!");
     const micBtn = h('button', {}, '🎤 Test the microphone'); micBtn.onclick = () => testMic(micBtn);
 
     el.innerHTML = '';
@@ -1011,8 +1095,19 @@ SCREENS.grown = () => {
         } }, '➕ Add a word')),
         rows),
 
-      h('section', {}, h('h2', {}, '🗣️ Computer voice'),
-        h('p', { class: 'sub' }, "Used for anything you haven't recorded. The \"Google\" voices sound the most natural but need internet. Your own recordings always play instead of this voice."),
+      h('section', {}, h('h2', {}, "🐥 Pip's voice"),
+        h('p', { class: 'sub' }, 'Tap a voice to hear it. The one you tap last is the one Pip uses.'),
+        h('div', { class: 'row' }, PIP_VOICES.map(([id, label, desc]) => h('button', {
+          class: S.pipVoice === id ? 'primary' : '',
+          onclick: async () => {
+            S.pipVoice = id; await save(); await loadVoice(id);
+            el.querySelectorAll('.voice-pick').forEach(b => b.classList.toggle('primary', b.dataset.v === id));
+            tts("Hello! Where's duck? Peekaboo! There's duck! Quack quack! Can you say duck? Well done!");
+          }, 'data-v': id, title: desc,
+        }, `▶ ${label}`)).map(b => { b.classList.add('voice-pick'); return b; }))),
+
+      h('section', {}, h('h2', {}, '🗣️ Backup computer voice'),
+        h('p', { class: 'sub' }, "Pip speaks with a natural recorded voice. This computer voice is only used for words you add yourself and haven't recorded. Your own recordings always play first."),
         h('div', { class: 'row' },
           h('select', { onchange: async e => { S.voice = e.target.value; await save(); sample(); } },
             h('option', { value: '' }, `Automatic (${(pickVoiceAuto() || {}).name || 'default'})`),
@@ -1056,7 +1151,7 @@ SCREENS.grown = () => {
       if (data.app !== 'little-world') throw new Error('not a backup');
       if (!confirm('Replace everything here with this backup?')) return;
       for (const [id, url] of Object.entries(data.blobs || {})) await blobSet(id, await (await fetch(url)).blob());
-      S = tidy(Object.assign(defaults(), data.settings)); await save(); rerender(); alert('Backup restored ✅');
+      S = tidy(Object.assign(defaults(), data.settings)); loadVoice(S.pipVoice); await save(); rerender(); alert('Backup restored ✅');
     } catch (e) { alert("That file isn't a Little World backup."); }
   }
 
@@ -1068,6 +1163,7 @@ SCREENS.grown = () => {
 (async () => {
   await openDB();
   S = tidy(Object.assign(defaults(), (await kvGet('settings')) || {}));
+  loadVoice(S.pipVoice);
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   buildLock();
   if (location.hash === '#smoke') return smoke();
