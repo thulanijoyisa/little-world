@@ -1,0 +1,1090 @@
+'use strict';
+// If anything goes wrong, show it in the window title so it can be diagnosed instead of a blank screen.
+window.addEventListener('error', e => { document.title = 'LW-ERR ' + e.message + ' @' + (e.lineno || ''); });
+window.addEventListener('unhandledrejection', e => { document.title = 'LW-ERR ' + ((e.reason && (e.reason.stack || e.reason.message)) || e.reason); });
+/* Little World: a toddler play-and-talk app with Pip, a friend who listens.
+   Everything (photos, voices, her recordings) is stored only in this browser on this device. */
+
+// ---------------- helpers ----------------
+const $ = s => document.querySelector(s);
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const rand = (a, b) => a + Math.random() * (b - a);
+const shuffle = a => { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const today = () => new Date().toISOString().slice(0, 10);
+// Screen state lives up here because the voice loader can run before the rest of the file.
+const SCREENS = {};
+let cur = null, sessionStart = null, lastInput = 0;
+const COLORS = ['#ff6b6b', '#ffa94d', '#fcc419', '#51cf66', '#20c997', '#339af0', '#845ef7', '#f06595'];
+
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === 'class') e.className = v;
+    else if (k === 'style') e.style.cssText = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (k === 'value') e.value = v;
+    else if (k === 'checked') e.checked = !!v;
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? '' : v);
+  }
+  for (const c of kids.flat()) { if (c == null || c === false) continue; e.append(c instanceof Node ? c : document.createTextNode(c)); }
+  return e;
+}
+
+// ---------------- storage (IndexedDB) ----------------
+let db;
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('littleworld', 1);
+    r.onupgradeneeded = () => { r.result.createObjectStore('kv'); r.result.createObjectStore('blobs'); };
+    r.onsuccess = () => { db = r.result; res(); };
+    r.onerror = () => rej(r.error);
+  });
+}
+function tx(store, mode, fn) {
+  return new Promise((res, rej) => {
+    const t = db.transaction(store, mode); const r = fn(t.objectStore(store));
+    t.oncomplete = () => res(r && r.result); t.onerror = () => rej(t.error);
+  });
+}
+const kvGet = k => tx('kv', 'readonly', s => s.get(k));
+const kvSet = (k, v) => tx('kv', 'readwrite', s => s.put(v, k));
+const blobGet = k => tx('blobs', 'readonly', s => s.get(k));
+const blobSet = (k, v) => tx('blobs', 'readwrite', s => s.put(v, k));
+const blobDel = k => k ? tx('blobs', 'readwrite', s => s.delete(k)) : null;
+const urlCache = {};
+async function blobURL(id) {
+  if (!id) return null;
+  if (urlCache[id]) return urlCache[id];
+  const b = await blobGet(id);
+  return b ? (urlCache[id] = URL.createObjectURL(b)) : null;
+}
+
+const STARTER = [
+  ['Mama', '👩'], ['Daddy', '👨'], ['Gogo', '👵'], ['Baby', '👶'], ['Dog', '🐶'], ['Cat', '🐱'],
+  ['Ball', '⚽'], ['Cup', '🥤'], ['Shoes', '👟'], ['Car', '🚗'], ['Water', '💧'], ['Milk', '🥛'],
+  ['Banana', '🍌'], ['Book', '📖'], ['Bird', '🐦'], ['Cow', '🐄'], ['Sun', '☀️'], ['Moon', '🌙'],
+  ['Hat', '👒'], ['Bath', '🛁'], ['Teddy', '🧸'], ['Duck', '🦆'],
+];
+// Animal sounds, said after the animal's name: "Duck! Quack quack!"
+const SOUNDS = {
+  dog: 'Woof woof!', puppy: 'Woof woof!', cat: 'Meow!', kitty: 'Meow!', cow: 'Moo!', duck: 'Quack quack!',
+  bird: 'Tweet tweet!', chicken: 'Cluck cluck!', hen: 'Cluck cluck!', frog: 'Ribbit!', lion: 'Roar!',
+  elephant: 'Toot toot!', sheep: 'Baa baa!', pig: 'Oink oink!', horse: 'Neigh!', goat: 'Meh meh!',
+  owl: 'Hoo hoo!', bee: 'Buzz buzz!', snake: 'Hiss!', monkey: 'Ooh ooh ah ah!', mouse: 'Squeak squeak!',
+  car: 'Beep beep!', train: 'Choo choo!', baby: 'Waa waa!',
+};
+const soundOf = t => t && !t.self && SOUNDS[(t.en || '').trim().toLowerCase()];
+const ANIMALS = [['🐶', 'Dog'], ['🐱', 'Cat'], ['🐮', 'Cow'], ['🐔', 'Chicken'], ['🐦', 'Bird'], ['🐸', 'Frog'], ['🐘', 'Elephant'], ['🦁', 'Lion']];
+const NOTES = [262, 294, 330, 349, 392, 440, 494, 523];
+
+function defaults() {
+  return {
+    name: '', photo: null, birthday: '', nameRec: [], bdayRec: [], minutes: 15, listen: true, voice: '',
+    words: STARTER.map(([en, emoji]) => ({ id: uid(), en, emoji, photo: null, rec: { en: [] } })),
+    herClips: [], keepVoice: true, countTo: 5, setupDone: false,
+  };
+}
+// Older saves had isiZulu fields; keep only what the English app uses.
+function tidy(s) {
+  s.words = (s.words || []).map(w => ({ id: w.id || uid(), en: w.en || '', emoji: w.emoji || '⭐', photo: w.photo || null, rec: { en: (w.rec && w.rec.en) || [] } }));
+  s.herClips = s.herClips || [];
+  for (const k of ['diary', 'gallery', 'who']) delete s[k];
+  return s;
+}
+let S;
+const save = () => kvSet('settings', S);
+const herName = () => S.name || 'sweetheart';
+
+// ---------------- sound ----------------
+let AC, sfxUntil = 0;
+function ac() {
+  if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+  if (AC.state === 'suspended') AC.resume();
+  return AC;
+}
+function tone(freq, dur = 0.25, type = 'sine', vol = 0.25) {
+  const a = ac(), o = a.createOscillator(), g = a.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.setValueAtTime(vol, a.currentTime); g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+  o.connect(g).connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  sfxUntil = Math.max(sfxUntil, Date.now() + dur * 1000 + 150);
+}
+function slide(from, to, dur = 0.35, vol = 0.2) {
+  const a = ac(), o = a.createOscillator(), g = a.createGain();
+  o.type = 'sine'; o.frequency.setValueAtTime(from, a.currentTime); o.frequency.exponentialRampToValueAtTime(to, a.currentTime + dur);
+  g.gain.setValueAtTime(vol, a.currentTime); g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+  o.connect(g).connect(a.destination); o.start(); o.stop(a.currentTime + dur); sfxUntil = Math.max(sfxUntil, Date.now() + dur * 1000 + 150);
+}
+const sfx = {
+  pop() { tone(rand(600, 1000), 0.12, 'sine', 0.3); },
+  soft() { tone(330, 0.3, 'sine', 0.15); },
+  tada() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.35, 'triangle'), i * 110)); },
+  peek() { slide(300, 1100, 0.3); setTimeout(() => [988, 1175, 988, 1319].forEach((f, i) => setTimeout(() => tone(f, 0.09, 'triangle', 0.18), i * 85)), 280); },
+  hide() { slide(700, 220, 0.35, 0.15); },
+  whoosh() { slide(200, 1600, 0.5, 0.06); },
+  boing() { slide(180, 520, 0.25, 0.25); },
+};
+
+// Speech: recorded family voices first, the computer's voice as a fallback.
+let voices = [];
+function loadVoices() {
+  const had = voices.length;
+  voices = window.speechSynthesis ? speechSynthesis.getVoices() : [];
+  // Chrome lists voices a moment after start-up; refresh the voice picker if it was already showing.
+  if (!had && voices.length && cur && cur.name === 'grown') go('grown');
+}
+if (window.speechSynthesis) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
+// Joke voices that come with macOS; never offer these.
+const SILLY = /Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Wobble|Fred|Good News|Jester|Junior|Organ|Superstar|Ralph|Trinoids|Whisper|Zarvox|Rocko|Grandpa|Eddy|Reed/i;
+function niceVoices() { return voices.filter(v => /^en/i.test(v.lang) && !SILLY.test(v.name)); }
+// Most natural first: Chrome's Google voices, then Apple's best ones.
+const PREFER = [/Google UK English Female/, /Google US English/, /Premium/, /Enhanced/, /^Samantha/, /^Flo.*(UK|Kingdom)/, /^Shelley.*(UK|Kingdom)/, /^Karen/, /^Moira/, /^Daniel/, /^Tessa/];
+function pickVoice() {
+  const nice = niceVoices();
+  const chosen = S && S.voice && nice.find(v => v.name === S.voice);
+  return chosen || pickVoiceAuto();
+}
+function pickVoiceAuto() {
+  const nice = niceVoices();
+  for (const re of PREFER) { const v = nice.find(v => re.test(v.name)); if (v) return v; }
+  return nice[0];
+}
+function tts(text, pitch = 1) {
+  return new Promise(res => {
+    if (!window.speechSynthesis || !text) return res();
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text), v = pickVoice();
+    if (v) { u.voice = v; u.lang = v.lang; }
+    u.rate = 0.9; u.pitch = pitch;
+    let done = false; const fin = () => { if (!done) { done = true; res(); } };
+    u.onend = fin; u.onerror = fin; setTimeout(fin, 4500);
+    speechSynthesis.speak(u);
+  });
+}
+let curAudio = null;
+function playURL(url, rate = 1) {
+  return new Promise(res => {
+    if (!url) return res(false);
+    if (curAudio) curAudio.pause();
+    const a = new Audio(url); curAudio = a;
+    if (rate !== 1) { a.preservesPitch = false; a.playbackRate = rate; }
+    let done = false; const fin = v => { if (!done) { done = true; res(v); } };
+    a.onended = () => fin(true); a.onerror = () => fin(false); a.onpause = () => fin(true);
+    a.play().catch(() => fin(false)); setTimeout(() => fin(true), 9000);
+  });
+}
+async function playBlob(id, rate) { return playURL(await blobURL(id), rate); }
+function stopSound() { if (curAudio) curAudio.pause(); if (window.speechSynthesis) speechSynthesis.cancel(); }
+const speaking = () => (curAudio && !curAudio.paused && !curAudio.ended) || (window.speechSynthesis && speechSynthesis.speaking);
+function appTalking() { return speaking() || Date.now() < sfxUntil; }
+async function sayWord(w) {
+  const recs = w.rec.en;
+  if (recs.length && await playBlob(pick(recs).id)) return;
+  await tts(w.en);
+}
+async function sayName() { if (S.nameRec.length && await playBlob(pick(S.nameRec))) return; await tts(herName()); }
+
+// "Things" are her words plus herself, used by the games.
+const SELF = { self: true };
+const thingName = t => t.self ? herName() : t.en;
+const hasRec = t => t.self ? S.nameRec.length > 0 : t.rec.en.length > 0;
+const sayThing = t => t.self ? sayName() : sayWord(t);
+// Says "Where's Mama?" in one natural sentence, or around the family recording when there is one.
+async function sayAround(before, t, after = '') {
+  if (!hasRec(t)) await tts(`${before} ${thingName(t)}${after}`.trim());
+  else {
+    if (before) await tts(before);
+    await sayThing(t);
+    if (after.replace(/^[?!.,]\s*/, '')) await tts(after.replace(/^[?!.,]\s*/, ''));
+  }
+}
+// The thing's name, then its sound if it has one: "Duck! Quack quack!"
+async function sayWithSound(before, t) {
+  await sayAround(before, t, '!');
+  const s = soundOf(t);
+  if (s) { await wait(150); await tts(s, 1.15); }
+}
+async function thingPic(t) { return t.self ? faceEl() : pictureEl(t); }
+function thingDeck() {
+  let order = [], i = 0;
+  return () => {
+    if (i >= order.length) { order = shuffle([SELF, ...S.words.filter(w => w.en)]); i = 0; }
+    return order[i++];
+  };
+}
+
+// ---------------- microphone: the ear that listens to her ----------------
+let micStream = null;
+async function getMic() {
+  if (micStream && micStream.active) return micStream;
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  return micStream;
+}
+// Turns captured sound into a small WAV file, made louder so a quiet little voice plays back clearly.
+function toWav(chunks, rate) {
+  const n = chunks.reduce((a, c) => a + c.length, 0), all = new Float32Array(n);
+  let o = 0; for (const c of chunks) { all.set(c, o); o += c.length; }
+  let data = all, r = rate;
+  if (rate >= 44100) { data = new Float32Array(n >> 1); for (let i = 0; i < data.length; i++) data[i] = (all[2 * i] + all[2 * i + 1]) / 2; r = Math.round(rate / 2); }
+  let peak = 0; for (const x of data) peak = Math.max(peak, Math.abs(x));
+  const g = peak > 0 ? Math.min(5, 0.9 / peak) : 1;
+  const buf = new ArrayBuffer(44 + data.length * 2), v = new DataView(buf);
+  const w = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + data.length * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, r, true);
+  v.setUint32(28, r * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, data.length * 2, true);
+  for (let i = 0; i < data.length; i++) { const s = Math.max(-1, Math.min(1, data[i] * g)); v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true); }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+const ear = {
+  ready: false, level: 0, floor: 0.01, pre: [], job: null, rate: 48000, starting: null,
+  start() {
+    if (this.ready) return Promise.resolve(true);
+    if (!this.starting) this.starting = (async () => {
+      try {
+        const st = await getMic(), a = ac(); this.rate = a.sampleRate;
+        const src = a.createMediaStreamSource(st), node = a.createScriptProcessor(2048, 1, 1), mute = a.createGain();
+        mute.gain.value = 0; src.connect(node); node.connect(mute).connect(a.destination);
+        node.onaudioprocess = e => this.frame(e.inputBuffer.getChannelData(0));
+        this.node = node; this.ready = true; return true;
+      } catch (e) { this.starting = null; return false; }
+    })();
+    // Don't let a game wait forever if Chrome is still asking for microphone permission.
+    return Promise.race([this.starting, wait(4000).then(() => false)]);
+  },
+  frame(d) {
+    let s = 0; for (const x of d) s += x * x;
+    const rms = Math.sqrt(s / d.length), ms = d.length / this.rate * 1000;
+    this.level = rms;
+    const thr = Math.max(0.02, this.floor * 3), loud = rms > thr, chunk = new Float32Array(d), j = this.job;
+    if (!j || !j.cap) {
+      if (!loud) this.floor = this.floor * 0.97 + rms * 0.03; // learn the room's background noise
+      this.pre.push(chunk); if (this.pre.length > Math.ceil(400 / ms)) this.pre.shift();
+    }
+    if (!j) return;
+    // Ignore our own voices and sounds, and the clatter of her hitting keys.
+    const blocked = appTalking() || Date.now() - lastInput < 400;
+    if (!j.cap) {
+      if (blocked) { j.on = 0; return; }
+      if (Date.now() > j.deadline) return this.finish(null);
+      j.on = loud ? j.on + 1 : 0;
+      if (j.on >= 3) { j.cap = this.pre.slice(); j.voiced = j.on * ms; j.quiet = 0; j.len = j.cap.length * ms; }
+    } else {
+      j.cap.push(chunk); j.len += ms;
+      if (loud) { j.voiced += ms; j.quiet = 0; } else j.quiet += ms;
+      if (j.quiet >= j.silence || j.len >= j.maxLen) {
+        if (j.voiced < 250) { j.cap = null; j.on = 0; return; } // just a bump, keep listening
+        const trim = Math.max(0, Math.floor((j.quiet - 250) / ms));
+        this.finish(j.cap.slice(0, j.cap.length - trim));
+      }
+    }
+  },
+  finish(chunks) { const j = this.job; this.job = null; if (j) j.resolve(chunks && chunks.length ? toWav(chunks, this.rate) : null); },
+  // Resolves with a WAV of what she said, or null if she stayed quiet.
+  listen({ wait: w = 6000, maxLen = 5000, silence = 800 } = {}) {
+    this.cancel();
+    if (!this.ready) return Promise.resolve(null);
+    return new Promise(resolve => { this.job = { resolve, deadline: Date.now() + w, maxLen, silence, on: 0, cap: null }; });
+  },
+  cancel() { if (this.job) { const j = this.job; this.job = null; j.resolve(null); } },
+};
+const micOK = async () => S.listen && await ear.start();
+// Plays back what she said; keeps it as a keepsake if the grown-ups chose to.
+async function keepHer(blob, word) {
+  if (S.keepVoice) {
+    const id = uid(); await blobSet(id, blob);
+    S.herClips.push({ id, word, date: today() });
+    while (S.herClips.length > 80) { const old = S.herClips.shift(); await blobDel(old.id); }
+    await save();
+    return blobURL(id);
+  }
+  return URL.createObjectURL(blob);
+}
+
+// ---------------- Pip, her friend ----------------
+const PIP_SVG = `<svg viewBox="0 0 200 230" aria-hidden="true">
+<ellipse class="pshadow" cx="100" cy="222" rx="58" ry="7" fill="rgba(0,0,0,.12)"/>
+<g class="pbody">
+ <ellipse cx="78" cy="208" rx="17" ry="9" fill="#ff922b"/><ellipse cx="122" cy="208" rx="17" ry="9" fill="#ff922b"/>
+ <ellipse class="parm pl" cx="30" cy="128" rx="15" ry="32" fill="#fab005"/>
+ <ellipse class="parm pr" cx="170" cy="128" rx="15" ry="32" fill="#fab005"/>
+ <path d="M90 46 C84 22 98 12 103 26 C108 8 128 16 114 46 Z" fill="#fab005"/>
+ <circle cx="100" cy="122" r="82" fill="#ffd43b"/>
+ <ellipse cx="100" cy="152" rx="50" ry="42" fill="#fff3bf"/>
+ <g class="popen"><circle cx="72" cy="104" r="19" fill="#fff"/><circle cx="128" cy="104" r="19" fill="#fff"/>
+  <circle cx="74" cy="107" r="10" fill="#3b2a1a"/><circle cx="130" cy="107" r="10" fill="#3b2a1a"/>
+  <circle cx="78" cy="102" r="3.5" fill="#fff"/><circle cx="134" cy="102" r="3.5" fill="#fff"/></g>
+ <g class="pjoy" fill="none" stroke="#3b2a1a" stroke-width="6" stroke-linecap="round"><path d="M58 108 Q72 90 86 108"/><path d="M114 108 Q128 90 142 108"/></g>
+ <g class="psleep" fill="none" stroke="#3b2a1a" stroke-width="5" stroke-linecap="round"><path d="M58 104 Q72 116 86 104"/><path d="M114 104 Q128 116 142 104"/></g>
+ <circle cx="50" cy="136" r="12" fill="#ff8787" opacity=".55"/><circle cx="150" cy="136" r="12" fill="#ff8787" opacity=".55"/>
+ <path class="psm" d="M86 140 Q100 156 114 140" fill="none" stroke="#c92a2a" stroke-width="6" stroke-linecap="round"/>
+ <ellipse class="pmo" cx="100" cy="146" rx="14" ry="11" fill="#c92a2a"/>
+</g></svg>`;
+function pipEl(size = '') { const d = h('div', { class: 'pip ' + size }); d.innerHTML = PIP_SVG; return d; }
+function pipMood(p, mood, ms) {
+  p.classList.remove('happy', 'listening', 'dance', 'wave', 'sleep');
+  if (mood) { void p.offsetWidth; p.classList.add(mood); }
+  if (mood && ms) setTimeout(() => p.classList.remove(mood), ms);
+}
+// Pip's mouth moves whenever anything is speaking; the listening ring grows with her voice.
+(function lipSync() {
+  const talking = !!speaking();
+  for (const p of document.querySelectorAll('.pip')) {
+    p.classList.toggle('talking', talking && !p.classList.contains('sleep'));
+    p.style.setProperty('--lvl', Math.min(1, ear.level * 10).toFixed(2));
+  }
+  requestAnimationFrame(lipSync);
+})();
+// After a picture appears, Pip listens for a moment and cheers if she says anything.
+async function invite(pip, t, alive, w = 4000) {
+  if (!S.listen || !ear.ready) return false;
+  pipMood(pip, 'listening');
+  const heard = await ear.listen({ wait: w });
+  if (!alive()) return false;
+  pipMood(pip, null);
+  if (!heard) return false;
+  pipMood(pip, 'happy', 2400); sfx.tada(); confetti(40);
+  await keepHer(heard, thingName(t));
+  await tts(pick(['Yes!', 'Well done!', 'Good talking!', 'Wow!']));
+  if (alive()) await sayThing(t);
+  return true;
+}
+
+// ---------------- pictures & effects ----------------
+async function resizeImage(file, max = 900) {
+  const url = URL.createObjectURL(file), img = new Image();
+  try { await new Promise((r, j) => { img.onload = r; img.onerror = j; img.src = url; }); }
+  finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
+  const sc = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.naturalWidth * sc); c.height = Math.round(img.naturalHeight * sc);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  return new Promise(r => c.toBlob(r, 'image/jpeg', 0.85));
+}
+async function pictureEl(w) {
+  const u = await blobURL(w.photo);
+  return u ? h('img', { class: 'pic', src: u, alt: w.en }) : h('div', { class: 'emoji-pic' }, w.emoji || '⭐');
+}
+async function faceEl() {
+  const u = await blobURL(S.photo);
+  return u ? h('img', { class: 'face', src: u, alt: '' }) : h('div', { class: 'face emoji-pic' }, '🧒🏾');
+}
+function sparkle(x, y) {
+  x = x ?? rand(60, innerWidth - 60); y = y ?? rand(60, innerHeight - 60);
+  const s = h('div', { class: 'sparkle', style: `left:${x - 28}px;top:${y - 28}px` }, pick(['✨', '⭐', '🌟', '💫', '💖']));
+  document.body.append(s); setTimeout(() => s.remove(), 950);
+}
+function confetti(n = 60) {
+  const box = h('div', { class: 'confetti' });
+  for (let i = 0; i < n; i++) box.append(h('i', { style: `left:${Math.random() * 100}%;background:${pick(COLORS)};animation-delay:${Math.random() * 0.5}s;animation-duration:${rand(1.6, 3)}s` }));
+  document.body.append(box); setTimeout(() => box.remove(), 3800);
+}
+// Soft clouds drifting across the back of a screen.
+function sky() {
+  return h('div', { class: 'sky' }, [0, 1, 2].map(i => h('span', { class: 'cloud', style: `top:${8 + i * 22}%;animation-duration:${38 + i * 14}s;animation-delay:-${i * 13}s;font-size:${70 + i * 30}px` }, '☁️')));
+}
+function bdayInfo() {
+  if (!S.birthday) return null;
+  const b = new Date(S.birthday + 'T00:00'); if (isNaN(b)) return null;
+  const now = new Date(), t = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const next = new Date(t.getFullYear(), b.getMonth(), b.getDate());
+  if (next < t) next.setFullYear(next.getFullYear() + 1);
+  const days = Math.round((next - t) / 864e5);
+  return { days, age: next.getFullYear() - b.getFullYear(), isToday: days === 0 };
+}
+
+// ---------------- screen manager ----------------
+function go(name, ...args) {
+  if (cur && cur.cleanup) { try { cur.cleanup(); } catch (e) {} }
+  stopSound(); ear.cancel();
+  const root = $('#app'); root.innerHTML = '';
+  cur = SCREENS[name](...args) || {}; cur.name = name;
+  if (!document.title.startsWith('LW-ERR')) document.title = 'Little World · ' + name;
+  root.append(cur.el);
+  $('#lock').classList.toggle('hidden', name === 'grown');
+  if (!['grown', 'splash', 'goodnight'].includes(name) && !sessionStart) sessionStart = Date.now();
+}
+function homeBtn() { return h('button', { class: 'home-btn', 'aria-label': 'Home', onpointerdown: e => { e.stopPropagation(); go('home'); } }, '🏠'); }
+
+document.addEventListener('keydown', e => {
+  if (cur && cur.name === 'grown') return; // normal typing in the grown-up corner
+  e.preventDefault(); lastInput = Date.now();
+  if (e.repeat || !cur || !cur.onKey) return;
+  ac();
+  cur.onKey(e);
+}, true);
+document.addEventListener('pointerdown', () => { lastInput = Date.now(); }, true);
+document.addEventListener('contextmenu', e => { if (!cur || cur.name !== 'grown') e.preventDefault(); });
+document.addEventListener('gesturestart', e => e.preventDefault());
+
+// Grown-up lock: hold for 3 seconds.
+function buildLock() {
+  const b = h('button', { id: 'lock', 'aria-label': 'Grown-up corner (hold 3 seconds)' }, h('span', { class: 'ring' }), '🔒');
+  let t = null;
+  const cancel = () => { clearTimeout(t); t = null; b.classList.remove('holding'); };
+  b.addEventListener('pointerdown', e => { e.stopPropagation(); e.preventDefault(); b.classList.add('holding'); t = setTimeout(() => { cancel(); go('grown'); }, 3000); });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => b.addEventListener(ev, cancel));
+  document.body.append(b);
+}
+
+// Gentle wind-down after the play time set in the grown-up corner.
+setInterval(() => {
+  if (!S || !S.minutes || !sessionStart || !cur) return;
+  if (['grown', 'goodnight', 'splash'].includes(cur.name)) return;
+  if (Date.now() - sessionStart > S.minutes * 60000) go('goodnight');
+}, 5000);
+
+// ---------------- screens ----------------
+SCREENS.splash = () => {
+  const el = h('div', { class: 'screen splash' }, sky(), h('div', {}, '…'));
+  (async () => {
+    el.lastChild.remove();
+    el.append(await faceEl(), h('h1', {}, `${S.name ? S.name + "'s" : 'Little'} World`), h('p', {}, 'Press any key or tap to play'));
+  })();
+  let started = false;
+  const start = async () => {
+    if (started) return; started = true;
+    ac(); if (S.listen) ear.start();
+    try { if (!document.fullscreenElement) await document.documentElement.requestFullscreen(); } catch (e) {}
+    const bi = bdayInfo();
+    go(bi && bi.isToday ? 'birthday' : 'home', true);
+  };
+  el.addEventListener('pointerdown', start);
+  return { el, onKey: start };
+};
+
+SCREENS.home = (greet) => {
+  const games = [['talk', 'pip', 'Talk with Pip'], ['copy', '🦜', 'Copy me!'], ['peekaboo', '🙈', 'Peekaboo'], ['hiding', '🌳', "Who's hiding?"],
+    ['words', '🗣️', 'My Words'], ['numbers', '🔢', 'Counting'], ['paint', '🎨', 'Paint'], ['bubbles', '🫧', 'Bubbles'], ['piano', '🐮', 'Animals']];
+  const bi = bdayInfo();
+  if (bi && bi.days <= 30) games.unshift(['birthday', '🎂', bi.isToday ? 'Birthday!' : 'Birthday']);
+  const tiles = games.map(([id, ic, label], i) => h('button', { class: 'tile', style: `background:${COLORS[i % COLORS.length]};animation-delay:${i * 60}ms`, onclick: () => go(id) },
+    ic === 'pip' ? pipEl('ontile') : h('span', { class: 'ic' }, ic), label));
+  const header = h('header', {});
+  const el = h('div', { class: 'screen home' }, sky(), header,
+    bi && !bi.isToday && bi.days <= 30 ? h('div', { class: 'countdown' }, `🎂 ${bi.days} more ${bi.days === 1 ? 'sleep' : 'sleeps'} until ${herName()} turns ${bi.age}!`) : null,
+    h('div', { class: 'tiles' }, tiles));
+  (async () => { header.append(await faceEl(), h('h1', {}, `${S.name ? S.name + "'s" : 'Little'} World`)); })();
+  if (greet) (async () => { await tts('Hello'); await sayName(); })();
+  let sel = -1, lastSay = 0;
+  function key(e) {
+    if ((e.key === 'Enter' || e.key === ' ') && sel >= 0) return go(games[sel][0]);
+    sel = (sel + 1) % games.length;
+    tiles.forEach((t, i) => t.classList.toggle('sel', i === sel));
+    sfx.pop();
+    if (Date.now() - lastSay > 900) { lastSay = Date.now(); tts(games[sel][2].replace(/[!?]/g, '')); }
+  }
+  return { el, onKey: key };
+};
+
+// Talk with Pip: Pip shows a picture, asks her to say it, listens, cheers and plays her own voice back.
+SCREENS.talk = () => {
+  const pip = pipEl('big'), card = h('div', { class: 'talk-card' }), label = h('div', { class: 'talk-word' });
+  const note = h('div', { class: 'mic-note hidden' }, '🎤 Microphone is off, so Pip just talks');
+  const el = h('div', { class: 'screen talk' }, sky(), homeBtn(), h('div', { class: 'talk-row' }, pip, h('div', { class: 'talk-right' }, card, label)), note,
+    h('div', { class: 'hint' }, 'Say the word! Tap for a new picture'));
+  const next = thingDeck();
+  let alive = true, skip = false, lastSkip = 0;
+  const go_on = () => alive && !skip;
+  async function run() {
+    await wait(300);
+    const mic = await micOK();
+    if (!alive) return;
+    if (!mic) note.classList.remove('hidden');
+    pipMood(pip, 'wave', 2000); await tts('Hello'); await sayName(); if (!alive) return; await tts("Let's talk!");
+    while (alive) {
+      skip = false; pipMood(pip, null);
+      const t = next();
+      card.innerHTML = ''; card.append(await thingPic(t)); card.classList.remove('pop'); void card.offsetWidth; card.classList.add('pop');
+      label.textContent = thingName(t);
+      if (t.self) { await tts('Look! It is'); if (go_on()) await sayName(); } else await sayWithSound('Look!', t);
+      if (!go_on()) continue;
+      await wait(300);
+      if (t.self) await tts('Can you say your name?'); else await sayAround('Can you say', t, '?');
+      if (!go_on()) continue;
+      let heard = null;
+      if (mic) { pipMood(pip, 'listening'); heard = await ear.listen({ wait: 6000 }); pipMood(pip, null); }
+      else await wait(3000);
+      if (!go_on()) continue;
+      if (heard) {
+        pipMood(pip, 'happy'); sfx.tada(); confetti(50);
+        const clip = await keepHer(heard, thingName(t));
+        await tts(pick(['Yay! You said it!', 'Well done!', 'Wow, clever!', 'Yes! Good talking!']));
+        if (!go_on()) continue;
+        pipMood(pip, 'dance'); await tts('Listen to you!'); await playURL(clip); await wait(300);
+        if (!go_on()) continue;
+        pipMood(pip, null); await sayThing(t);
+      } else {
+        await sayThing(t);
+      }
+      if (go_on()) await wait(1000);
+    }
+  }
+  run();
+  const skipNow = () => { if (Date.now() - lastSkip < 2500) return; lastSkip = Date.now(); skip = true; ear.cancel(); stopSound(); sfx.whoosh(); };
+  el.addEventListener('pointerdown', e => { sparkle(e.clientX, e.clientY); skipNow(); });
+  return { el, onKey: () => { sparkle(); skipNow(); }, cleanup() { alive = false; ear.cancel(); } };
+};
+
+// Copy me: Pip listens and repeats whatever she says in a squeaky voice.
+SCREENS.copy = () => {
+  const pip = pipEl('big'), msg = h('div', { class: 'copy-say' }, 'Say something!');
+  const el = h('div', { class: 'screen copy' }, sky(), homeBtn(), pip, msg, h('div', { class: 'hint' }, 'Talk, sing or shout, and Pip copies you!'));
+  let alive = true;
+  async function run() {
+    await wait(300);
+    const mic = await micOK();
+    if (!alive) return;
+    if (!mic) { msg.textContent = '🎤 Microphone is off'; await tts('Tap me!'); return; }
+    pipMood(pip, 'wave', 2000); await tts("Say something! I'll copy you!");
+    while (alive) {
+      pipMood(pip, 'listening'); msg.textContent = 'Say something! 👂';
+      const heard = await ear.listen({ wait: 20000, maxLen: 4000, silence: 700 });
+      if (!alive) return;
+      pipMood(pip, null);
+      if (!heard) { await tts(pick(['Say something!', 'Hello? Talk to me!', 'Can you sing?'])); continue; }
+      msg.textContent = '🦜 ✨';
+      const url = URL.createObjectURL(heard);
+      pipMood(pip, 'dance'); await playURL(url, 1.45); URL.revokeObjectURL(url);
+      if (!alive) return;
+      pipMood(pip, 'happy', 900); sfx.boing(); await wait(700);
+    }
+  }
+  run();
+  const tap = () => { pipMood(pip, 'happy', 700); sfx.boing(); };
+  el.addEventListener('pointerdown', tap);
+  return { el, onKey: tap, cleanup() { alive = false; ear.cancel(); } };
+};
+
+// Peekaboo: a picture hides under a blanket. Tap: "Peekaboo! There's Duck! Quack quack!" Tap again: it hides again.
+SCREENS.peekaboo = () => {
+  const picBox = h('div', { class: 'peek-pic' });
+  const blanket = h('div', { class: 'blanket' }, h('span', {}, '🙈'));
+  const label = h('div', { class: 'peek-label' });
+  const pip = pipEl('side');
+  const el = h('div', { class: 'screen peekaboo' }, sky(), homeBtn(), h('div', { class: 'peek-card' }, picBox, blanket), label, pip,
+    h('div', { class: 'hint' }, 'Tap or press any key'));
+  const next = thingDeck();
+  let thing = null, covered = true, busy = false, alive = true;
+  const isAlive = () => alive;
+  async function hide(first) {
+    busy = true; covered = true; ear.cancel(); pipMood(pip, null);
+    blanket.classList.remove('up'); label.textContent = '';
+    if (!first) sfx.hide();
+    await wait(first ? 0 : 450);
+    thing = next(); picBox.innerHTML = ''; picBox.append(await thingPic(thing));
+    if (!alive) return;
+    await wait(250); await sayAround("Where's", thing, '?');
+    busy = false;
+  }
+  async function reveal() {
+    busy = true; covered = false;
+    blanket.classList.add('up'); sfx.peek(); confetti(30); pipMood(pip, 'happy', 1500);
+    picBox.classList.remove('bounce'); void picBox.offsetWidth; picBox.classList.add('bounce');
+    label.textContent = thingName(thing); label.classList.remove('pop'); void label.offsetWidth; label.classList.add('pop');
+    await wait(450); if (!alive) return;
+    await tts('Peekaboo!');
+    if (thing.self) { await tts('There you are,'); await sayName(); } else await sayWithSound("There's", thing);
+    busy = false;
+    invite(pip, thing, isAlive, 3500);
+  }
+  const tap = () => { if (busy) return; covered ? reveal() : hide(); };
+  el.addEventListener('pointerdown', e => { sparkle(e.clientX, e.clientY); tap(); });
+  hide(true);
+  return { el, onKey: () => { sparkle(); tap(); }, cleanup() { alive = false; } };
+};
+
+// Who's hiding? Three bushes; eyes peek out now and then. Tap one and someone pops up.
+SCREENS.hiding = () => {
+  const next = thingDeck();
+  const spots = [0, 1, 2].map(i => {
+    const peeker = h('div', { class: 'peeker' });
+    const eyes = h('div', { class: 'bush-eyes' }, '👀');
+    const bush = h('div', { class: 'bush', style: `--hue:${[110, 135, 95][i]}` }, eyes, h('span', {}, pick(['🌼', '🌸', '🌷'])));
+    const spot = h('div', { class: 'spot' }, peeker, bush);
+    return { spot, peeker, bush, eyes, busy: false };
+  });
+  const el = h('div', { class: 'screen hiding' }, homeBtn(), h('div', { class: 'spots' }, spots.map(s => s.spot)),
+    h('div', { class: 'hint' }, 'Tap a bush'));
+  let alive = true;
+  async function open(s) {
+    if (s.busy || !alive) return; s.busy = true;
+    const t = next();
+    s.peeker.innerHTML = ''; s.peeker.append(await thingPic(t), h('div', { class: 'peek-name' }, thingName(t)));
+    s.bush.classList.remove('wiggle'); void s.bush.offsetWidth; s.bush.classList.add('wiggle');
+    s.peeker.classList.add('out'); sfx.peek();
+    await wait(350); if (!alive) return;
+    if (t.self) { await tts('Peekaboo!'); await sayName(); } else await sayWithSound('Peekaboo!', t);
+    await wait(1400); if (!alive) return;
+    s.peeker.classList.remove('out'); sfx.hide();
+    await wait(500); s.busy = false;
+  }
+  spots.forEach(s => s.spot.addEventListener('pointerdown', () => open(s)));
+  // Every few seconds a pair of eyes peeks out of a bush, inviting her to tap it.
+  const peekIv = setInterval(() => {
+    const free = spots.filter(s => !s.busy); if (!free.length) return;
+    const s = pick(free);
+    s.eyes.classList.remove('peeking'); void s.eyes.offsetWidth; s.eyes.classList.add('peeking');
+    s.bush.classList.remove('rustle'); void s.bush.offsetWidth; s.bush.classList.add('rustle');
+  }, 2600);
+  function key(e) {
+    const free = spots.filter(s => !s.busy);
+    if (!free.length) return;
+    const want = spots[(e.key || 'a').toLowerCase().charCodeAt(0) % 3];
+    open(free.includes(want) ? want : pick(free));
+  }
+  (async () => { await wait(300); if (alive) await tts("Who's hiding?"); })();
+  return { el, onKey: key, cleanup() { alive = false; clearInterval(peekIv); } };
+};
+
+SCREENS.words = () => {
+  const card = h('div', { class: 'wordcard' }), pip = pipEl('side');
+  const el = h('div', { class: 'screen words' }, sky(), homeBtn(), card, pip, h('div', { class: 'hint' }, 'Press any key or tap'));
+  let order = [], i = 0, busy = false, alive = true, lastNext = 0;
+  async function next() {
+    if (busy || !S.words.length || Date.now() - lastNext < 1500) return; // key-mashing can't skip faster than she can hear
+    lastNext = Date.now(); busy = true; stopSound(); ear.cancel(); pipMood(pip, null);
+    if (i >= order.length) { order = shuffle(S.words.map(w => w.id)); i = 0; }
+    const w = S.words.find(x => x.id === order[i++]);
+    if (w) {
+      const pic = await pictureEl(w);
+      card.innerHTML = ''; card.append(pic, h('div', { class: 'en' }, w.en));
+      card.classList.remove('pop'); void card.offsetWidth; card.classList.add('pop');
+      sfx.pop(); await wait(200);
+      busy = false; // she can tap for the next picture at any time
+      teach(w, ++lesson);
+    } else busy = false;
+  }
+  // Teach it the way a teacher would: name it, say it again slowly, invite her, wait, then praise or say it once more.
+  let lesson = 0;
+  async function teach(w, me) {
+    const still = () => alive && me === lesson;
+    await sayWithSound('Look!', w); if (!still()) return;
+    await wait(500); pipMood(pip, 'wave', 1200);
+    await sayAround(pick(['Say it with me.', 'Can you say it?', 'Your turn!']), w, '!'); if (!still()) return;
+    let heard = null;
+    if (S.listen && ear.ready) { pipMood(pip, 'listening'); heard = await ear.listen({ wait: 4500 }); if (!still()) return; pipMood(pip, null); }
+    else await wait(2500);
+    if (!still()) return;
+    if (heard) {
+      pipMood(pip, 'happy', 2400); sfx.tada(); confetti(40); keepHer(heard, w.en);
+      await tts(pick(['Yes!', 'Well done!', 'Good talking!'])); if (still()) await sayWord(w);
+    } else {
+      await sayWord(w); // say it once more, so she hears it again
+    }
+  }
+  el.addEventListener('pointerdown', e => { sparkle(e.clientX, e.clientY); next(); });
+  next();
+  return { el, onKey: () => { sparkle(); next(); }, cleanup() { alive = false; } };
+};
+
+// Counting: each tap adds one more thing; Pip counts them all, lighting each one up, like a teacher pointing.
+const COUNT_THEMES = [['🦆', 'duck', 'ducks'], ['⚽', 'ball', 'balls'], ['⭐', 'star', 'stars'], ['🍎', 'apple', 'apples'],
+  ['🚗', 'car', 'cars'], ['🐟', 'fish', 'fish'], ['🎈', 'balloon', 'balloons'], ['🐶', 'dog', 'dogs'], ['🍌', 'banana', 'bananas']];
+const NUM_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+SCREENS.numbers = () => {
+  const big = h('div', { class: 'big-num' }), row = h('div', { class: 'count-row' }), caption = h('div', { class: 'count-cap' });
+  const pip = pipEl('side');
+  const el = h('div', { class: 'screen numbers' }, sky(), homeBtn(), big, row, caption, pip, h('div', { class: 'hint' }, 'Tap or press a key to add one more'));
+  const max = S.countTo || 5;
+  let theme = pick(COUNT_THEMES), items = [], busy = false, alive = true;
+  const still = () => alive;
+  function fresh() {
+    theme = pick(COUNT_THEMES.filter(t => t !== theme)); items = [];
+    row.innerHTML = ''; big.textContent = ''; caption.textContent = '';
+    row.classList.toggle('two-rows', max > 5);
+  }
+  async function add() {
+    if (busy || !alive) return; busy = true; ear.cancel(); pipMood(pip, null);
+    const n = items.length + 1;
+    const it = h('div', { class: 'count-item' }, theme[0]);
+    items.push(it); row.append(it); sfx.pop();
+    // Count them all from one, lighting each as it's said.
+    for (let i = 0; i < n; i++) {
+      if (!alive) return;
+      items[i].classList.remove('lit'); void items[i].offsetWidth; items[i].classList.add('lit');
+      big.textContent = String(i + 1); big.classList.remove('pop'); void big.offsetWidth; big.classList.add('pop');
+      tone(NOTES[Math.min(i, 7)], 0.18, 'triangle', 0.15);
+      await tts(i + 1 === n ? `${NUM_WORDS[i + 1]}!` : NUM_WORDS[i + 1]);
+    }
+    if (!alive) return;
+    caption.textContent = `${n} ${n === 1 ? theme[1] : theme[2]}`;
+    await tts(`${NUM_WORDS[n]} ${n === 1 ? theme[1] : theme[2]}!`);
+    if (n >= max) {
+      pipMood(pip, 'happy', 2500); sfx.tada(); confetti(80);
+      await tts(pick(['Well done! You counted them all!', 'Yay! Clever counting!', `Wow! ${NUM_WORDS[n]}!`]));
+      if (alive && S.listen && ear.ready) {
+        await tts(`Can you say ${NUM_WORDS[n]}?`);
+        const t = { en: NUM_WORDS[n], rec: { en: [] } };
+        await invite(pip, t, still, 4000);
+      }
+      if (!alive) return;
+      await wait(600); row.classList.add('bye'); sfx.whoosh(); await wait(600); row.classList.remove('bye');
+      fresh();
+      await tts(`Let's count ${theme[2]}!`);
+    }
+    busy = false;
+  }
+  fresh();
+  (async () => { await wait(300); if (alive) await tts(`Let's count ${theme[2]}! Tap!`); })();
+  el.addEventListener('pointerdown', e => { sparkle(e.clientX, e.clientY); add(); });
+  return { el, onKey: () => { sparkle(); add(); }, cleanup() { alive = false; } };
+};
+
+SCREENS.paint = () => {
+  const c = h('canvas', {});
+  const el = h('div', { class: 'screen paintwrap' }, c, homeBtn(), h('div', { class: 'paint-tools' }, h('button', { class: 'big-btn', onpointerdown: e => { e.stopPropagation(); sfx.whoosh(); size(); } }, '✨ New picture')));
+  const ctx = c.getContext('2d');
+  let hue = Math.random() * 360, last = null, down = false;
+  function size() {
+    const r = devicePixelRatio || 1; c.width = innerWidth * r; c.height = innerHeight * r;
+    ctx.setTransform(r, 0, 0, r, 0, 0); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, innerWidth, innerHeight);
+  }
+  size();
+  function line(x, y) {
+    ctx.strokeStyle = `hsl(${hue},85%,58%)`; ctx.lineWidth = 30; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath(); ctx.moveTo(last ? last.x : x, last ? last.y : y); ctx.lineTo(x, y); ctx.stroke();
+    hue = (hue + 2) % 360; last = { x, y };
+  }
+  // A mouse or trackpad paints just by moving (a 2-year-old can't hold the click); touch paints while touching.
+  c.addEventListener('pointerdown', e => { down = true; last = null; line(e.offsetX, e.offsetY); sfx.pop(); });
+  c.addEventListener('pointermove', e => { if (e.pointerType === 'mouse' || down) line(e.offsetX, e.offsetY); });
+  c.addEventListener('pointerup', () => { down = false; last = null; });
+  c.addEventListener('pointerleave', () => { last = null; });
+  function stamp() {
+    const x = rand(40, innerWidth - 40), y = rand(60, innerHeight - 60);
+    ctx.font = '90px serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(pick(['⭐', '❤️', '🌸', '🦋', '🌈', '🐞', '☀️', '🍓', '🐠', '🌼']), x, y);
+    sfx.pop();
+  }
+  return { el, onKey: stamp };
+};
+
+// Bubbles: Pip says "Pop!" as they burst and dances when she talks.
+SCREENS.bubbles = () => {
+  const field = h('div', { class: 'field' }), pip = pipEl('buddy');
+  const note = h('div', { class: 'mic-note' }, '🎤 Talk to Pip!');
+  const el = h('div', { class: 'screen bubbles' }, field, pip, homeBtn());
+  let alive = true, raf = 0, loud = 0, lastCheer = 0, lastPop = 0;
+  const photoWords = S.words.filter(w => w.photo);
+  async function spawn() {
+    const size = rand(80, 160);
+    const b = h('div', { class: 'bubble', style: `width:${size}px;height:${size}px;left:${rand(2, 88)}%;animation-duration:${rand(7, 12)}s` });
+    if (photoWords.length && Math.random() < 0.3) {
+      const w = pick(photoWords), u = await blobURL(w.photo);
+      if (u) { b.style.backgroundImage = `url(${u})`; b.classList.add('photo'); b.dataset.word = w.id; }
+    }
+    b.addEventListener('pointerdown', e => { e.stopPropagation(); pop(b); });
+    b.addEventListener('animationend', () => { if (!b.classList.contains('popped')) b.remove(); });
+    if (alive) field.append(b);
+  }
+  function pop(b) {
+    if (!b || b.classList.contains('popped')) return;
+    b.classList.add('popped'); sfx.pop();
+    const w = b.dataset.word && S.words.find(x => x.id === b.dataset.word);
+    if (w) sayWord(w);
+    else if (!speaking() && Date.now() - lastPop > 1200) {
+      lastPop = Date.now(); pipMood(pip, 'happy', 600);
+      tts(pick(['Pop!', 'Pop!', 'Pop pop!', 'Pop!', 'Wheee!']), 1.25);
+    }
+    setTimeout(() => b.remove(), 320);
+  }
+  const popAny = () => { const bs = [...field.querySelectorAll('.bubble:not(.popped)')]; bs.length ? pop(pick(bs)) : sfx.soft(); };
+  const iv = setInterval(() => { if (field.children.length < 14) spawn(); }, 650);
+  for (let i = 0; i < 4; i++) setTimeout(spawn, i * 200);
+  function loop() {
+    if (!alive) return;
+    if (!appTalking() && ear.level > 0.05) {
+      loud++; pip.classList.add('dance');
+      if (loud % 8 === 0) popAny();
+      if (loud > 25 && Date.now() - lastCheer > 7000) { lastCheer = Date.now(); tts(pick(['I hear you!', 'Yay! Talk to me!', 'What a big voice!'])); }
+    } else { loud = Math.max(0, loud - 1); if (!loud) pip.classList.remove('dance'); }
+    raf = requestAnimationFrame(loop);
+  }
+  micOK().then(ok => { if (ok && alive) { el.append(note); loop(); } });
+  el.addEventListener('pointerdown', popAny);
+  return { el, onKey: popAny, cleanup() { alive = false; clearInterval(iv); cancelAnimationFrame(raf); } };
+};
+
+SCREENS.piano = () => {
+  const keys = ANIMALS.map((a, i) => h('div', { class: 'pkey', style: `--c:${COLORS[i]}`, onpointerdown: () => hit(i) },
+    h('div', { class: 'pa' }, a[0]), h('div', { class: 'pn' }, a[1])));
+  const el = h('div', { class: 'screen piano' }, homeBtn(), h('div', { class: 'pkeys' }, keys));
+  let lastSay = 0, sound = false;
+  function hit(i) {
+    tone(NOTES[i], 0.5, 'triangle', 0.3);
+    const k = keys[i]; k.classList.remove('hit'); void k.offsetWidth; k.classList.add('hit');
+    if (Date.now() - lastSay > 1500) {
+      lastSay = Date.now(); sound = !sound;
+      const name = ANIMALS[i][1], w = S.words.find(x => x.en.toLowerCase() === name.toLowerCase());
+      // Alternate the animal's name and its sound: "Cow" ... "Moo!"
+      setTimeout(() => (sound ? tts(SOUNDS[name.toLowerCase()], 1.15) : w ? sayWord(w) : tts(name)), 350);
+    }
+  }
+  const row = 'asdfghjk';
+  return { el, onKey: e => { const k = (e.key || 'a').toLowerCase(); hit(row.includes(k) ? row.indexOf(k) : k.charCodeAt(0) % 8); } };
+};
+
+SCREENS.birthday = () => {
+  const bi = bdayInfo(), n = Math.max(1, Math.min(8, bi ? bi.age : 2));
+  const flames = [], candles = h('div', { class: 'candles' });
+  for (let i = 0; i < n; i++) { const f = h('div', { class: 'flame' }); flames.push(f); candles.append(h('div', { class: 'candle', onpointerdown: blowOne }, f)); }
+  const top = h('div', {});
+  const el = h('div', { class: 'screen birthday' }, homeBtn(), top, h('div', { class: 'bmsg' }, `Happy Birthday, ${herName()}!`),
+    h('div', { class: 'cake' }, candles, h('div', { class: 'cake-body' }, h('div', { class: 'cake-num' }, String(n)))),
+    h('div', { class: 'hint' }, 'Blow! 🌬️ Or tap the candles'));
+  (async () => top.append(await faceEl()))();
+  let alive = true, raf = 0, loud = 0, partying = false;
+  function blowOne() {
+    if (partying) return;
+    const f = flames.find(f => !f.classList.contains('out')); if (!f) return;
+    f.classList.add('out'); tone(200, 0.25, 'sine', 0.12);
+    if (flames.every(f => f.classList.contains('out'))) party();
+  }
+  async function party() {
+    partying = true; sfx.tada(); confetti(120); setTimeout(() => alive && confetti(120), 1000);
+    await wait(700);
+    if (S.bdayRec.length) { for (const id of S.bdayRec) { if (!alive) return; await playBlob(id); await wait(300); } }
+    else { await tts('Happy birthday'); await sayName(); await tts(`You are ${n}!`); }
+    await wait(1500);
+    if (alive) { flames.forEach(f => f.classList.remove('out')); partying = false; }
+  }
+  function loop() {
+    if (!alive) return;
+    if (!appTalking() && ear.level > 0.12) { if (++loud > 8) { loud = 0; blowOne(); } } else loud = Math.max(0, loud - 1);
+    raf = requestAnimationFrame(loop);
+  }
+  micOK().then(ok => ok && alive && loop());
+  (async () => { await tts('Happy birthday'); await sayName(); await tts("Let's blow out the candles!"); })();
+  return { el, onKey: blowOne, cleanup() { alive = false; cancelAnimationFrame(raf); } };
+};
+
+SCREENS.goodnight = () => {
+  const pip = pipEl('big sleep');
+  const el = h('div', { class: 'screen goodnight' }, h('div', { class: 'zz' }, 'z z z'), pip,
+    h('h1', {}, 'All done for now!'), h('p', {}, 'Night night 🌙  Pip is sleeping'));
+  (async () => { await tts('All done for now'); await sayName(); await tts('Night night!'); })();
+  return { el, onKey: () => {} };
+};
+
+// ---------------- grown-up corner ----------------
+function recButton(label, onBlob) {
+  const b = h('button', { class: 'rec' }, '🎙 ' + label);
+  let r = null;
+  b.onclick = async () => {
+    if (r) return r.stop();
+    try { r = await recordClip(6000); }
+    catch (e) { alert('The microphone is blocked. Click the camera/mic icon in the address bar and allow it, then try again.'); return; }
+    b.classList.add('on'); b.textContent = '■ Stop';
+    const blob = await r.done; r = null;
+    b.classList.remove('on'); b.textContent = '🎙 ' + label;
+    if (!blob.size) return;
+    const id = uid(); await blobSet(id, blob); await onBlob(id); playBlob(id);
+  };
+  return b;
+}
+async function recordClip(maxMs = 6000) {
+  const st = await getMic();
+  const mime = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+  const rec = new MediaRecorder(st, mime ? { mimeType: mime } : undefined), chunks = [];
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  const done = new Promise(r => { rec.onstop = () => r(new Blob(chunks, { type: rec.mimeType || mime || 'audio/webm' })); });
+  rec.start();
+  const t = setTimeout(() => rec.state !== 'inactive' && rec.stop(), maxMs);
+  return { stop() { clearTimeout(t); if (rec.state !== 'inactive') rec.stop(); }, done };
+}
+function recChip(text, id, onDelete) {
+  return h('span', { class: 'chip' }, text,
+    h('button', { title: 'Play', onclick: () => playBlob(id) }, '▶'),
+    h('button', { title: 'Delete', onclick: async () => { if (confirm('Delete this recording?')) { await blobDel(id); await onDelete(); } } }, '✕'));
+}
+function photoPicker(onBlob) {
+  const inp = h('input', { type: 'file', accept: 'image/*', style: 'display:none' });
+  inp.onchange = async () => {
+    const f = inp.files[0]; if (!f) return;
+    try { const blob = await resizeImage(f); const id = uid(); await blobSet(id, blob); await onBlob(id); }
+    catch (e) { alert("That photo didn't open. If it came from an iPhone (HEIC), open it in Preview, choose File → Export, pick JPEG, then try again."); }
+    inp.value = '';
+  };
+  return inp;
+}
+function allBlobIds() {
+  const ids = [S.photo, ...S.nameRec, ...S.bdayRec, ...S.herClips.map(c => c.id)];
+  for (const w of S.words) { ids.push(w.photo); for (const r of w.rec.en) ids.push(r.id); }
+  return ids.filter(Boolean);
+}
+const blobToDataURL = b => new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(b); });
+function download(blob, name) { const a = h('a', { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove(); }
+
+SCREENS.grown = () => {
+  const el = h('div', { class: 'screen grown' });
+  const rerender = async () => { const y = el.scrollTop; await render(); el.scrollTop = y; };
+
+  async function wordRow(w) {
+    const thumb = h('div', { class: 'thumb', title: 'Add a photo' });
+    const u = await blobURL(w.photo);
+    thumb.append(u ? h('img', { src: u, alt: '' }) : (w.emoji || '⭐'));
+    const picker = photoPicker(async id => { await blobDel(w.photo); w.photo = id; await save(); rerender(); });
+    thumb.onclick = () => picker.click();
+    const recs = h('div', { class: 'recs' }, w.rec.en.map((r, i) => recChip(`Recording ${i + 1}`, r.id, async () => {
+      w.rec.en = w.rec.en.filter(x => x.id !== r.id); await save(); rerender();
+    })));
+    return h('div', { class: 'wordrow' }, h('div', {}, thumb, picker),
+      h('div', {},
+        h('input', { type: 'text', value: w.en, placeholder: 'Word', onchange: async e => { w.en = e.target.value.trim(); await save(); } }),
+        h('div', { class: 'row', style: 'margin-top:8px' },
+          recButton('Record', async id => { w.rec.en.push({ id }); await save(); rerender(); }),
+          h('button', { onclick: () => sayWithSound('', w) }, '🔊 Hear it'),
+          h('button', { onclick: () => picker.click() }, w.photo ? '📷 Change photo' : '📷 Add photo'),
+          h('button', { onclick: async () => {
+            if (!confirm(`Remove "${w.en}" and its photo and recordings?`)) return;
+            await blobDel(w.photo); for (const r of w.rec.en) await blobDel(r.id);
+            S.words = S.words.filter(x => x !== w); await save(); rerender();
+          } }, '🗑')),
+        recs));
+  }
+
+  async function testMic(btn) {
+    btn.disabled = true; btn.textContent = '🎤 Say something now…';
+    const ok = await ear.start();
+    if (!ok) { btn.disabled = false; btn.textContent = '🎤 Test the microphone'; return alert('The microphone is blocked or still waiting. Click the mic icon in the address bar, choose Allow, then try again.'); }
+    const heard = await ear.listen({ wait: 6000 });
+    btn.disabled = false; btn.textContent = '🎤 Test the microphone';
+    if (!heard) return alert("Pip didn't hear anything. Try speaking a little louder or closer to the device.");
+    const u = URL.createObjectURL(heard); await playURL(u); URL.revokeObjectURL(u);
+  }
+
+  async function render() {
+    const herPic = photoPicker(async id => { await blobDel(S.photo); S.photo = id; await save(); rerender(); });
+    const faceU = await blobURL(S.photo);
+    const nameRecs = h('div', { class: 'recs' }, S.nameRec.map(id => recChip('Her name', id, async () => { S.nameRec = S.nameRec.filter(x => x !== id); await save(); rerender(); })));
+    const bdayRecs = h('div', { class: 'recs' }, S.bdayRec.map(id => recChip('Birthday message', id, async () => { S.bdayRec = S.bdayRec.filter(x => x !== id); await save(); rerender(); })));
+    const herRecs = h('div', { class: 'recs' }, S.herClips.slice().reverse().map(c => recChip(`${c.word} · ${c.date}`, c.id, async () => { S.herClips = S.herClips.filter(x => x.id !== c.id); await save(); rerender(); })));
+    const rows = []; for (const w of S.words) rows.push(await wordRow(w));
+    const importInp = h('input', { type: 'file', accept: 'application/json,.json', style: 'display:none', onchange: e => importAll(e.target.files[0]) });
+    const sample = () => tts(`Hello ${herName()}! Where's the duck? Peekaboo! Quack quack!`);
+    const micBtn = h('button', {}, '🎤 Test the microphone'); micBtn.onclick = () => testMic(micBtn);
+
+    el.innerHTML = '';
+    el.append(h('div', { class: 'wrap' },
+      h('h1', {}, '🔒 Grown-up corner'),
+      h('p', { class: 'sub' }, 'Everything you add stays on this device only. Nothing is uploaded. To come back here, hold the 🔒 in the top corner for 3 seconds.'),
+      !S.setupDone ? h('section', { class: 'welcome' }, h('h2', {}, 'Welcome! 🎉'),
+        h('p', { class: 'sub' }, "Add her name, her photo and a few family photos, then test the microphone so Pip can hear her. You can skip anything and add more later.")) : null,
+
+      h('section', {}, h('h2', {}, 'About her'),
+        h('label', {}, 'Her name (shown on screen)'),
+        h('input', { type: 'text', value: S.name, placeholder: 'Her name or nickname', onchange: async e => { S.name = e.target.value.trim(); await save(); } }),
+        h('label', {}, 'Her photo (she shows up in the games too)'),
+        h('div', { class: 'row' }, faceU ? h('img', { src: faceU, alt: '', style: 'width:70px;height:70px;border-radius:50%;object-fit:cover' }) : null,
+          h('button', { onclick: () => herPic.click() }, faceU ? '📷 Change photo' : '📷 Add her photo'), herPic),
+        h('label', {}, 'Say her name (the app greets her with your voice)'),
+        h('div', { class: 'row' }, recButton('Record her name', async id => { S.nameRec.push(id); await save(); rerender(); })), nameRecs,
+        h('label', {}, 'Date of birth (for the birthday countdown and birthday mode)'),
+        h('input', { type: 'date', value: S.birthday, onchange: async e => { S.birthday = e.target.value; await save(); } })),
+
+      h('section', {}, h('h2', {}, '🐥 Pip listens to her'),
+        h('p', { class: 'sub' }, "Pip asks her to say words and cheers when she makes any sound. At her age every try counts, so Pip doesn't check if the word is right. Test the microphone once and press Allow if the browser asks."),
+        h('label', { style: 'display:flex;gap:8px;align-items:center;font-weight:400' },
+          h('input', { type: 'checkbox', checked: S.listen, onchange: async e => { S.listen = e.target.checked; await save(); } }),
+          'Let Pip listen (Talk with Pip, Copy me, Peekaboo, My Words, Bubbles and Birthday)'),
+        h('div', { class: 'row', style: 'margin-top:8px' }, micBtn)),
+
+      h('section', {}, h('h2', {}, '🎤 Her voice'),
+        h('p', { class: 'sub' }, S.herClips.length ? 'Her tries at words, newest first. A keepsake of her first words. The oldest are removed after 80.' : 'When she says words to Pip, her little recordings appear here.'),
+        h('label', { style: 'display:flex;gap:8px;align-items:center;font-weight:400' },
+          h('input', { type: 'checkbox', checked: S.keepVoice, onchange: async e => { S.keepVoice = e.target.checked; await save(); } }),
+          'Keep her recordings (only on this device)'),
+        herRecs,
+        S.herClips.length ? h('button', { style: 'margin-top:8px', onclick: async () => {
+          if (!confirm('Delete all her recordings?')) return;
+          for (const c of S.herClips) await blobDel(c.id); S.herClips = []; await save(); rerender();
+        } }, '🗑 Delete all') : null),
+
+      h('section', {}, h('h2', {}, 'Her words and pictures'),
+        h('p', { class: 'sub' }, "These show up in all the games. Tap a picture to use your own photo, like Gogo's face or her real cup. Animals make their sound too (Duck says \"Quack quack\"). Recording a word in your voice is optional."),
+        h('div', { class: 'row', style: 'margin:12px 0' }, h('button', { class: 'primary', onclick: async () => {
+          S.words.unshift({ id: uid(), en: '', emoji: '⭐', photo: null, rec: { en: [] } }); await save(); await rerender();
+          const first = el.querySelector('.wordrow input'); if (first) first.focus();
+        } }, '➕ Add a word')),
+        rows),
+
+      h('section', {}, h('h2', {}, '🗣️ Computer voice'),
+        h('p', { class: 'sub' }, "Used for anything you haven't recorded. The \"Google\" voices sound the most natural but need internet. Your own recordings always play instead of this voice."),
+        h('div', { class: 'row' },
+          h('select', { onchange: async e => { S.voice = e.target.value; await save(); sample(); } },
+            h('option', { value: '' }, `Automatic (${(pickVoiceAuto() || {}).name || 'default'})`),
+            niceVoices().map(v => h('option', { value: v.name, selected: v.name === S.voice }, `${v.name}${v.localService ? '' : ' (internet)'}`))),
+          h('button', { onclick: sample }, '🔊 Try it'))),
+
+      h('section', {}, h('h2', {}, '🎂 Birthday'),
+        h('p', { class: 'sub' }, 'Record "Happy birthday" messages from the family. They play after she blows out the candles. Birthday mode opens by itself on her birthday.'),
+        h('div', { class: 'row' }, recButton('Record a birthday message', async id => { S.bdayRec.push(id); await save(); rerender(); }),
+          h('button', { onclick: () => go('birthday') }, '👀 Preview birthday mode')), bdayRecs),
+
+      h('section', {}, h('h2', {}, '🔢 Counting'),
+        h('label', {}, 'Count up to'),
+        h('select', { onchange: async e => { S.countTo = +e.target.value; await save(); } },
+          [[3, '3 (just starting)'], [5, '5 (good at 2 years)'], [10, '10']].map(([v, t]) => h('option', { value: v, selected: v === (S.countTo || 5) }, t)))),
+
+      h('section', {}, h('h2', {}, 'Play time'),
+        h('label', {}, 'Play time before Pip says goodnight'),
+        h('select', { onchange: async e => { S.minutes = +e.target.value; await save(); } },
+          [[10, '10 minutes'], [15, '15 minutes'], [20, '20 minutes'], [30, '30 minutes'], [0, 'No limit']].map(([v, t]) => h('option', { value: v, selected: v === S.minutes }, t)))),
+
+      h('section', {}, h('h2', {}, 'Backup'),
+        h('p', { class: 'sub' }, 'Save her photos and voices into one file, to keep safe or copy to another device.'),
+        h('div', { class: 'row' }, h('button', { onclick: exportAll }, '💾 Save backup file'), h('button', { onclick: () => importInp.click() }, '📂 Open backup file'), importInp)),
+
+      h('div', { class: 'done-bar' }, h('button', { class: 'primary', onclick: async () => {
+        S.setupDone = true; await save(); sessionStart = null; go('splash');
+      } }, '✅ Done, back to play'))));
+  }
+
+  async function exportAll() {
+    const blobs = {};
+    for (const id of allBlobIds()) { const b = await blobGet(id); if (b) blobs[id] = await blobToDataURL(b); }
+    download(new Blob([JSON.stringify({ app: 'little-world', v: 3, settings: S, blobs })], { type: 'application/json' }),
+      `${(S.name || 'little').toLowerCase()}-world-backup-${today()}.json`);
+  }
+  async function importAll(file) {
+    if (!file) return;
+    try {
+      const data = JSON.parse(await file.text());
+      if (data.app !== 'little-world') throw new Error('not a backup');
+      if (!confirm('Replace everything here with this backup?')) return;
+      for (const [id, url] of Object.entries(data.blobs || {})) await blobSet(id, await (await fetch(url)).blob());
+      S = tidy(Object.assign(defaults(), data.settings)); await save(); rerender(); alert('Backup restored ✅');
+    } catch (e) { alert("That file isn't a Little World backup."); }
+  }
+
+  render();
+  return { el };
+};
+
+// ---------------- start ----------------
+(async () => {
+  await openDB();
+  S = tidy(Object.assign(defaults(), (await kvGet('settings')) || {}));
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  buildLock();
+  if (location.hash === '#smoke') return smoke();
+  go(S.setupDone ? 'splash' : 'grown');
+})();
+
+// Developer check: opens every screen, taps it a few times and reports errors (visit index.html#smoke).
+async function smoke() {
+  const out = [];
+  window.addEventListener('error', e => out.push('ERR ' + e.message));
+  window.addEventListener('unhandledrejection', e => out.push('REJ ' + (e.reason && e.reason.message)));
+  for (const s of ['grown', 'splash', 'home', 'talk', 'copy', 'peekaboo', 'hiding', 'words', 'numbers', 'paint', 'bubbles', 'piano', 'birthday', 'goodnight']) {
+    try {
+      go(s); await wait(400);
+      for (let i = 0; i < 3; i++) { if (cur.onKey) cur.onKey({ key: 'asd'[i] }); await wait(1500); }
+      out.push(s + ':ok');
+    } catch (e) { out.push(s + ':FAIL ' + e.message); }
+  }
+  go('grown'); document.title = 'SMOKE ' + out.join(' '); console.log('SMOKE', out.join(' '));
+}
