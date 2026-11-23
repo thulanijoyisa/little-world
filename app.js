@@ -78,23 +78,30 @@ const SOUNDS = {
   bird: 'Tweet tweet!', chicken: 'Cluck cluck!', hen: 'Cluck cluck!', frog: 'Ribbit!', lion: 'Roar!',
   elephant: 'Toot toot!', sheep: 'Baa baa!', pig: 'Oink oink!', horse: 'Neigh!', goat: 'Meh meh!',
   owl: 'Hoo hoo!', bee: 'Buzz buzz!', snake: 'Hiss!', monkey: 'Ooh ooh ah ah!', mouse: 'Squeak squeak!',
-  car: 'Beep beep!', train: 'Choo choo!', baby: 'Waa waa!',
+  car: 'Beep beep!', train: 'Choo choo!', baby: 'Waa waa!', bear: 'Grr!',
 };
 const soundOf = t => t && !t.self && SOUNDS[(t.en || '').trim().toLowerCase()];
 const ANIMALS = [['🐶', 'Dog'], ['🐱', 'Cat'], ['🐮', 'Cow'], ['🐔', 'Chicken'], ['🐦', 'Bird'], ['🐸', 'Frog'], ['🐘', 'Elephant'], ['🦁', 'Lion']];
+// Every game on the home screen. Little mode shows only a few, so she isn't faced with too many choices.
+const GAMES = [['talk', 'pip', 'Talk with Pip'], ['family', '👨‍👩‍👧', 'Family peekaboo'], ['peekaboo', '🙈', 'Peekaboo'], ['body', '👃', 'My body'],
+  ['feed', '🐵', 'Feed the animals'], ['songs', '🎵', 'Songs'], ['bubbles', '🫧', 'Bubbles'], ['copy', '🦜', 'Copy me!'], ['hiding', '🌳', "Who's hiding?"],
+  ['words', '🗣️', 'My Words'], ['colours', '🌈', 'Colours'], ['numbers', '🔢', 'Counting'], ['paint', '🎨', 'Paint'], ['piano', '🐮', 'Animals']];
+const LITTLE = ['talk', 'family', 'peekaboo', 'body', 'feed', 'songs', 'bubbles'];
 const NOTES = [262, 294, 330, 349, 392, 440, 494, 523];
 
 function defaults() {
   return {
     name: '', photo: null, birthday: '', nameRec: [], bdayRec: [], minutes: 15, listen: true, voice: '',
     words: STARTER.map(([en, emoji]) => ({ id: uid(), en, emoji, photo: null, rec: { en: [] } })),
-    herClips: [], keepVoice: true, countTo: 5, pipVoice: 'matilda', setupDone: false,
+    herClips: [], keepVoice: true, countTo: 5, pipVoice: 'matilda', setupDone: false, show: LITTLE.slice(), songRec: {},
   };
 }
 // Older saves had isiZulu fields; keep only what the English app uses.
 function tidy(s) {
   s.words = (s.words || []).map(w => ({ id: w.id || uid(), en: w.en || '', emoji: w.emoji || '⭐', photo: w.photo || null, rec: { en: (w.rec && w.rec.en) || [] } }));
   s.herClips = s.herClips || [];
+  if (!Array.isArray(s.show)) s.show = LITTLE.slice();
+  if (!s.songRec || typeof s.songRec !== 'object') s.songRec = {};
   for (const k of ['diary', 'gallery', 'who']) delete s[k];
   return s;
 }
@@ -346,10 +353,12 @@ async function sayWithSound(before, t) {
   if (s) { await wait(150); await tts(s, 1.15); }
 }
 async function thingPic(t) { return t.self ? faceEl() : pictureEl(t); }
-function thingDeck() {
+// Family peekaboo uses only the real photos: her own face and any word with a photo.
+const photoThings = () => [...(S.photo ? [SELF] : []), ...S.words.filter(w => w.en && w.photo)];
+function thingDeck(pool = () => [SELF, ...S.words.filter(w => w.en)]) {
   let order = [], i = 0;
   return () => {
-    if (i >= order.length) { order = shuffle([SELF, ...S.words.filter(w => w.en)]); i = 0; }
+    if (i >= order.length) { order = shuffle(pool()); i = 0; }
     return order[i++];
   };
 }
@@ -690,8 +699,9 @@ SCREENS.splash = () => {
 };
 
 SCREENS.home = (greet) => {
-  const games = [['talk', 'pip', 'Talk with Pip'], ['songs', '🎵', 'Songs'], ['copy', '🦜', 'Copy me!'], ['peekaboo', '🙈', 'Peekaboo'], ['hiding', '🌳', "Who's hiding?"],
-    ['words', '🗣️', 'My Words'], ['colours', '🌈', 'Colours'], ['numbers', '🔢', 'Counting'], ['paint', '🎨', 'Paint'], ['bubbles', '🫧', 'Bubbles'], ['piano', '🐮', 'Animals']];
+  const hasPhotos = photoThings().length > 0;
+  let games = GAMES.filter(g => S.show.includes(g[0]) && (g[0] !== 'family' || hasPhotos));
+  if (!games.length) games = GAMES.filter(g => g[0] !== 'family' || hasPhotos);
   const bi = bdayInfo();
   if (bi && bi.days <= 30) games.unshift(['birthday', '🎂', bi.isToday ? 'Birthday!' : 'Birthday']);
   const tiles = games.map(([id, ic, label], i) => h('button', { class: 'tile', style: `background:${COLORS[i % COLORS.length]};animation-delay:${i * 60}ms`, onclick: () => go(id) },
@@ -699,7 +709,7 @@ SCREENS.home = (greet) => {
   const header = h('header', {});
   const el = h('div', { class: 'screen home' }, sky(), header,
     bi && !bi.isToday && bi.days <= 30 ? h('div', { class: 'countdown' }, `🎂 ${bi.days} more ${bi.days === 1 ? 'sleep' : 'sleeps'} until ${herName()} turns ${bi.age}!`) : null,
-    h('div', { class: 'tiles' }, tiles));
+    h('div', { class: 'tiles' + (tiles.length <= 8 ? ' few' : ''), style: `--cols:${tiles.length <= 4 ? 2 : tiles.length <= 6 ? 3 : 4}` }, tiles));
   (async () => { header.append(await faceEl(), h('h1', {}, `${S.name ? S.name + "'s" : 'Little'} World`)); })();
   if (greet) chain(() => tts('Hello'), sayName);
   let sel = -1, lastSay = 0;
@@ -793,14 +803,15 @@ SCREENS.copy = () => {
 };
 
 // Peekaboo: a picture hides under a blanket. Tap: "Peekaboo! There's Duck! Quack quack!" Tap again: it hides again.
-SCREENS.peekaboo = () => {
+SCREENS.peekaboo = (mode) => {
+  const family = mode === 'family' && photoThings().length > 0;
   const picBox = h('div', { class: 'peek-pic' });
   const blanket = h('div', { class: 'blanket' }, h('span', {}, '🙈'));
   const label = h('div', { class: 'peek-label' });
   const pip = pipEl('side');
-  const el = h('div', { class: 'screen peekaboo' }, sky(), homeBtn(), h('div', { class: 'peek-card' }, picBox, blanket), label, pip,
+  const el = h('div', { class: 'screen peekaboo' + (family ? ' family' : '') }, sky(), homeBtn(), h('div', { class: 'peek-card' }, picBox, blanket), label, pip,
     h('div', { class: 'hint' }, 'Tap or press any key'));
-  const next = thingDeck();
+  const next = family ? thingDeck(photoThings) : thingDeck();
   let thing = null, covered = true, busy = false, alive = true;
   const isAlive = () => alive;
   async function hide(first) {
@@ -808,6 +819,7 @@ SCREENS.peekaboo = () => {
     blanket.classList.remove('up'); label.textContent = '';
     if (!first) sfx.hide();
     await wait(first ? 0 : 450);
+    if (first && family) { await tts('Family peekaboo'); if (!alive) return; }
     thing = next(); picBox.innerHTML = ''; picBox.append(await thingPic(thing));
     if (!alive) return;
     await wait(250); await sayAround("Where's", thing, '?');
@@ -829,6 +841,9 @@ SCREENS.peekaboo = () => {
   hide(true);
   return { el, onKey: () => { sparkle(); tap(); }, cleanup() { alive = false; } };
 };
+
+// Family peekaboo: the same game with only real photos. "Where's Mama?" ... "Peekaboo! There's Mama!"
+SCREENS.family = () => SCREENS.peekaboo('family');
 
 // Who's hiding? Three bushes; eyes peek out now and then. Tap one and someone pops up.
 SCREENS.hiding = () => {
@@ -912,6 +927,176 @@ SCREENS.words = () => {
   el.addEventListener('pointerdown', e => { sparkle(e.clientX, e.clientY); next(); });
   next();
   return { el, onKey: () => { sparkle(); next(); }, cleanup() { alive = false; } };
+};
+
+// ---------------- my body ----------------
+// "Where's your nose?" A teddy shows each part while Pip asks her to find her own, then do the action.
+const TEDDY_SVG = `<svg viewBox="0 0 300 420" aria-hidden="true">
+ <g class="bp" data-part="ears"><circle cx="78" cy="62" r="38" fill="#b07040"/><circle cx="78" cy="62" r="20" fill="#f3d2a8"/>
+  <circle cx="222" cy="62" r="38" fill="#b07040"/><circle cx="222" cy="62" r="20" fill="#f3d2a8"/></g>
+ <ellipse cx="72" cy="262" rx="26" ry="44" fill="#b07040" transform="rotate(28 72 262)"/>
+ <ellipse cx="228" cy="262" rx="26" ry="44" fill="#b07040" transform="rotate(-28 228 262)"/>
+ <ellipse cx="150" cy="300" rx="86" ry="92" fill="#b07040"/>
+ <g class="bp" data-part="hands"><ellipse cx="52" cy="292" rx="30" ry="30" fill="#9a5f35"/><ellipse cx="248" cy="292" rx="30" ry="30" fill="#9a5f35"/></g>
+ <g class="bp" data-part="tummy"><ellipse cx="150" cy="306" rx="54" ry="58" fill="#f3d2a8"/></g>
+ <g class="bp" data-part="toes"><ellipse cx="102" cy="384" rx="42" ry="28" fill="#9a5f35"/><ellipse cx="198" cy="384" rx="42" ry="28" fill="#9a5f35"/>
+  <g fill="#f3d2a8"><circle cx="86" cy="376" r="7"/><circle cx="102" cy="370" r="7"/><circle cx="118" cy="376" r="7"/><ellipse cx="102" cy="392" rx="15" ry="10"/>
+  <circle cx="182" cy="376" r="7"/><circle cx="198" cy="370" r="7"/><circle cx="214" cy="376" r="7"/><ellipse cx="198" cy="392" rx="15" ry="10"/></g></g>
+ <circle cx="150" cy="130" r="96" fill="#b07040"/>
+ <ellipse cx="150" cy="166" rx="44" ry="34" fill="#f3d2a8"/>
+ <circle cx="96" cy="150" r="13" fill="#ff8787" opacity=".5"/><circle cx="204" cy="150" r="13" fill="#ff8787" opacity=".5"/>
+ <g class="bp" data-part="eyes"><circle cx="112" cy="116" r="13" fill="#3b2a1a"/><circle cx="188" cy="116" r="13" fill="#3b2a1a"/>
+  <circle cx="116" cy="111" r="4.5" fill="#fff"/><circle cx="192" cy="111" r="4.5" fill="#fff"/></g>
+ <g class="bp" data-part="nose"><ellipse cx="150" cy="152" rx="17" ry="12" fill="#3b2a1a"/><ellipse cx="145" cy="148" rx="5" ry="3" fill="#fff" opacity=".6"/></g>
+ <g class="bp" data-part="mouth"><path d="M130 176 Q150 196 170 176" fill="none" stroke="#3b2a1a" stroke-width="6" stroke-linecap="round"/></g>
+</svg>`;
+const BODY = [
+  ['nose', "Where's your nose?", 'Touch your nose!'], ['eyes', 'Where are your eyes?', 'Touch your eyes!'],
+  ['ears', 'Where are your ears?', 'Touch your ears!'], ['mouth', "Where's your mouth?", 'Touch your mouth!'],
+  ['tummy', "Where's your tummy?", 'Pat your tummy!'], ['hands', 'Where are your hands?', 'Clap your hands!'],
+  ['toes', 'Where are your toes?', 'Wiggle your toes!'],
+];
+SCREENS.body = () => {
+  const teddy = h('div', { class: 'teddy' }); teddy.innerHTML = TEDDY_SVG;
+  const finger = h('div', { class: 'finger hidden' }, '👆'), word = h('div', { class: 'body-word' }), pip = pipEl('side');
+  const el = h('div', { class: 'screen body' }, sky(), homeBtn(), h('div', { class: 'body-row' }, teddy, word), finger, pip,
+    h('div', { class: 'hint' }, 'Tap the teddy!'));
+  const partEl = name => teddy.querySelector(`[data-part="${name}"]`);
+  const cap = s => s[0].toUpperCase() + s.slice(1);
+  let order = [], i = 0, lesson = 0, alive = true, lastNext = 0;
+  function show(name) {
+    teddy.querySelectorAll('.bp').forEach(p => p.classList.toggle('glow', p.dataset.part === name));
+    // the finger points at the teddy's part
+    const r = partEl(name).firstElementChild.getBoundingClientRect(); // one eye, one ear... not the gap between them
+    finger.style.left = `${r.left + r.width / 2}px`; finger.style.top = `${r.top + r.height / 2}px`;
+    finger.classList.remove('hidden', 'tap'); void finger.offsetWidth; finger.classList.add('tap');
+    word.textContent = cap(name); word.classList.remove('pop'); void word.offsetWidth; word.classList.add('pop');
+  }
+  function boop(name) {
+    const p = partEl(name); p.classList.remove('wig'); void p.getBoundingClientRect(); p.classList.add('wig');
+    sfx.boing();
+  }
+  async function teach(part, me, short) {
+    const [name, where, action] = part, still = () => alive && me === lesson;
+    show(name); ear.cancel(); pipMood(pip, null);
+    if (!short) {
+      await wait(300); if (!still()) return;
+      await tts(where); if (!still()) return;
+      await wait(1600); if (!still()) return; // time to find her own
+    }
+    boop(name); await tts(`${cap(name)}!`); if (!still()) return;
+    await wait(250); pipMood(pip, name === 'hands' || name === 'toes' ? 'dance' : 'wave', 2200);
+    if (name === 'hands') [0, 450, 900].forEach(d => setTimeout(() => still() && sfx.pop(), 1100 + d)); // clap clap clap
+    await tts(action); if (!still()) return;
+    await wait(2200); if (!still()) return;
+    pipMood(pip, 'happy', 1500); sfx.tada(); confetti(30);
+    await tts(pick(['Yay!', 'Well done!', 'Wow!'])); if (!still() || short) return;
+    await wait(300); await sayAround('Can you say', { en: name, rec: { en: [] } }, '?'); if (!still()) return;
+    await invite(pip, { en: name, rec: { en: [] } }, still, 4000);
+  }
+  function next() {
+    if (Date.now() - lastNext < 1500) return; // key-mashing can't skip faster than she can hear
+    lastNext = Date.now(); stopSound();
+    if (i >= order.length) { order = shuffle(BODY); i = 0; }
+    teach(order[i++], ++lesson);
+  }
+  // Tapping the teddy names that part straight away.
+  teddy.addEventListener('pointerdown', e => {
+    const p = e.target.closest('.bp'); if (!p) return;
+    e.stopPropagation(); sparkle(e.clientX, e.clientY);
+    if (Date.now() - lastNext < 900) return;
+    lastNext = Date.now(); stopSound();
+    teach(BODY.find(b => b[0] === p.dataset.part), ++lesson, true);
+  });
+  el.addEventListener('pointerdown', e => { sparkle(e.clientX, e.clientY); next(); });
+  setTimeout(() => alive && next(), 400);
+  return { el, onKey: () => { sparkle(); next(); }, cleanup() { alive = false; } };
+};
+
+// ---------------- feed the animals ----------------
+// An animal is hungry. Drag (or tap) a food to it: its favourite gets "Yum yum! Banana!", the others "No thank you!"
+const FEED = [['🐵', 'monkey', '🍌', 'banana'], ['🐰', 'bunny', '🥕', 'carrot'], ['🐶', 'dog', '🦴', 'bone'], ['🐱', 'cat', '🐟', 'fish'],
+  ['🐭', 'mouse', '🧀', 'cheese'], ['🐻', 'bear', '🍯', 'honey'], ['🐮', 'cow', '🌾', 'grass']];
+SCREENS.feed = () => {
+  const animal = h('div', { class: 'animal' }), tray = h('div', { class: 'foods' }), word = h('div', { class: 'feed-word' }), pip = pipEl('side');
+  const el = h('div', { class: 'screen feed' }, sky(), homeBtn(), animal, word, tray, pip, h('div', { class: 'hint' }, 'Drag the food to the animal, or tap it'));
+  const cap = s => s[0].toUpperCase() + s.slice(1);
+  const thing = en => ({ en, rec: { en: [] } });
+  let order = [], i = 0, want = null, busy = true, alive = true, drag = null;
+  const still = () => alive;
+  function centre(x) { const r = x.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }
+  async function nextAnimal() {
+    busy = true;
+    if (i >= order.length) { order = shuffle(FEED); i = 0; }
+    want = order[i++];
+    animal.textContent = want[0]; animal.className = 'animal'; void animal.offsetWidth; animal.classList.add('enter');
+    word.textContent = ''; tray.innerHTML = '';
+    sfx.peek(); await wait(500); if (!alive) return;
+    await sayWithSound('Look!', thing(cap(want[1]))); if (!alive) return;
+    await tts(`${want[1]} is hungry!`); if (!alive) return;
+    // its favourite food and two others, in a random order
+    const foods = shuffle([want, ...shuffle(FEED.filter(f => f !== want)).slice(0, 2)]);
+    foods.forEach((f, k) => tray.append(foodEl(f, k)));
+    await wait(300); if (!alive) return;
+    busy = false;
+    await tts(`Feed the ${want[1]}!`);
+  }
+  function foodEl(f, k) {
+    const b = h('div', { class: 'food', style: `animation-delay:${k * 120}ms` }, f[2]);
+    b.dataset.food = f[3];
+    b.addEventListener('pointerdown', e => {
+      e.stopPropagation(); if (busy) return;
+      drag = { b, x0: e.clientX, y0: e.clientY, moved: false, id: e.pointerId };
+      try { b.setPointerCapture(e.pointerId); } catch (err) {}
+      b.classList.add('drag'); sfx.pop();
+    });
+    b.addEventListener('pointermove', e => {
+      if (!drag || drag.b !== b) return;
+      const dx = e.clientX - drag.x0, dy = e.clientY - drag.y0;
+      if (Math.hypot(dx, dy) > 12) drag.moved = true;
+      b.style.transform = `translate(${dx}px,${dy}px) scale(1.25)`;
+    });
+    const up = e => {
+      if (!drag || drag.b !== b) return;
+      const d = drag; drag = null; b.classList.remove('drag');
+      const [ax, ay] = centre(animal), near = Math.hypot(e.clientX - ax, e.clientY - ay) < animal.offsetWidth * 0.75;
+      if (!d.moved || near) give(b); // a tap sends it flying to the animal
+      else { b.style.transform = ''; sfx.soft(); }
+    };
+    b.addEventListener('pointerup', up);
+    b.addEventListener('pointercancel', () => { if (drag && drag.b === b) { drag = null; b.classList.remove('drag'); b.style.transform = ''; } });
+    return b;
+  }
+  async function give(b) {
+    if (busy) return; busy = true; stopSound(); ear.cancel();
+    const food = b.dataset.food, [ax, ay] = centre(animal), [bx, by] = centre(b);
+    const base = b.style.transform.match(/translate\(([-\d.]+)px,\s*([-\d.]+)px\)/), ox = base ? +base[1] : 0, oy = base ? +base[2] : 0;
+    b.classList.add('fly'); b.style.transform = `translate(${ox + ax - bx}px,${oy + ay - by + animal.offsetHeight * 0.15}px) scale(.5)`;
+    await wait(420); if (!alive) return;
+    word.textContent = cap(food); word.classList.remove('pop'); void word.offsetWidth; word.classList.add('pop');
+    if (food === want[3]) {
+      b.classList.add('eaten'); animal.classList.remove('enter', 'shake'); void animal.offsetWidth; animal.classList.add('munch');
+      [0, 220, 440].forEach(d => setTimeout(() => alive && tone(rand(180, 240), 0.08, 'square', 0.08), d)); // nom nom nom
+      pipMood(pip, 'happy', 2500); confetti(50); setTimeout(() => alive && sfx.tada(), 600);
+      await tts(`Yum yum! ${cap(food)}!`); if (!alive) return;
+      await wait(300); await sayAround('Can you say', thing(food), '?'); if (!alive) return;
+      await invite(pip, thing(food), still, 3500); if (!alive) return;
+      await tts('All full!'); if (!alive) return;
+      animal.classList.add('leave'); sfx.whoosh(); await wait(700); if (!alive) return;
+      nextAnimal();
+    } else {
+      animal.classList.remove('enter', 'munch'); void animal.offsetWidth; animal.classList.add('shake');
+      b.classList.remove('fly'); b.style.transform = ''; sfx.boing();
+      await tts(`${cap(food)}? No thank you!`); if (!alive) return;
+      busy = false;
+    }
+  }
+  function key() {
+    if (busy) return;
+    const fs = [...tray.querySelectorAll('.food:not(.eaten)')]; if (fs.length) give(pick(fs));
+  }
+  setTimeout(() => alive && nextAnimal(), 300);
+  return { el, onKey: () => { sparkle(); key(); }, cleanup() { alive = false; } };
 };
 
 // Counting: each tap adds one more thing; Pip counts them all, lighting each one up, like a teacher pointing.
@@ -1121,6 +1306,48 @@ function backing(t, chord, beats, beat, meter, barPos) {
   return out;
 }
 const PENTA = ['C5', 'D5', 'E5', 'G5', 'A5', 'C6'].map(noteHz);
+// Schedules a whole song from audio time t0: a bar of count-in, the band, the tune, and the family's recorded singing if given.
+// Returns the sound nodes (to stop it early), cues (when each line starts and each note plays, for the words on screen) and the end time.
+function scheduleSong(song, t0, { melody = 0.2, voice = null } = {}) {
+  const a = ac(), beat = 60 / song.bpm, nodes = [], cues = [];
+  let t = t0, barPos = 0;
+  for (let k = 0; k < song.meter; k++) { nodes.push(...shaker(t, k === 0 ? 0.09 : 0.06), ...pluck(t, k === 0 ? 1568 : 1175, 0.08, 0.06)); t += beat; }
+  song.lines.map(parseLine).forEach((line, li) => {
+    const lineStart = t;
+    cues.push({ at: lineStart, line, li });
+    let ct = lineStart, cb = barPos;
+    for (const c of line.chords) { nodes.push(...backing(ct, c.nm, c.beats, beat, song.meter, cb)); ct += c.beats * beat; cb = (cb + c.beats) % song.meter; }
+    line.notes.forEach(n => {
+      const dur = n.beats * beat;
+      if (n.hz && melody) nodes.push(...bell(t, n.hz, dur, melody));
+      cues.push({ at: t, line, note: n, dur });
+      t += dur;
+    });
+    for (let b = lineStart; b < t - 0.01; b += beat / 2) nodes.push(...shaker(b, Math.abs(((b - lineStart) / beat) % 1) < 0.01 ? 0.045 : 0.025));
+    barPos = (barPos + Math.round((t - lineStart) / beat)) % song.meter;
+  });
+  if (voice) {
+    // voice.offset is where the count-in starts inside the recording
+    const src = a.createBufferSource(), g = a.createGain(), start = t0 - voice.offset, when = Math.max(a.currentTime, start);
+    src.buffer = voice.buf; g.gain.value = 1.5; src.connect(g).connect(a.destination);
+    src.start(when, when - start); nodes.push(src);
+  }
+  return { nodes, cues, end: t };
+}
+// Shows a line of words; each "~" note holds the word before it.
+function showLyric(box, line) {
+  box.innerHTML = ''; let last = null;
+  line.notes.forEach(n => {
+    if (n.tok === '~') { n.span = last; return; }
+    n.span = last = h('span', { class: 'syl' + (n.tok.endsWith('-') ? ' join' : '') }, n.tok.replace('{name}', herName()).replace(/-$/, ''));
+    box.append(n.span);
+  });
+}
+function lightLyric(box, n) { box.querySelectorAll('.syl.on').forEach(x => x.classList.remove('on')); if (n.span) n.span.classList.add('on'); }
+async function songVoice(id) {
+  const r = S.songRec[id]; if (!r) return null;
+  try { const b = await blobGet(r.id); return b ? { buf: await decodeAudio(await b.arrayBuffer()), offset: r.offset } : null; } catch (e) { return null; }
+}
 
 SCREENS.songs = () => {
   const pip = pipEl('side'), stage = h('div', { class: 'song-stage' });
@@ -1136,64 +1363,44 @@ SCREENS.songs = () => {
     stage.append(h('div', { class: 'song-grid' }, songs.map((s, i) => h('button', {
       class: 'song-card', style: `background:${COLORS[(i + 2) % COLORS.length]}`,
       onclick: e => { e.stopPropagation(); play(s); },
-    }, h('span', { class: 'ic' }, s.icon), s.title.replace('{name}', herName())))));
+    }, h('span', { class: 'ic' }, s.icon), s.title.replace('{name}', herName()), S.songRec[s.id] ? h('span', { class: 'sung' }, '🎤 Family') : null))));
   }
   async function play(song) {
     stopSong(); playing = true; nextIdx = list().indexOf(song) + 1;
-    const lines = song.lines.map(parseLine);
     const scene = h('div', { class: 'song-scene' }), lyric = h('div', { class: 'lyric' });
     stage.innerHTML = ''; stage.append(scene, lyric);
     scene.textContent = song.icon;
     pipMood(pip, 'wave', 1500);
+    const voiceP = songVoice(song.id);
     if (song.name) { await tts("Let's sing!"); if (!alive || !playing) return; await sayName(); }
     else await tts(`Let's sing! ${song.say}!`);
-    const face = await faceEl();
+    const face = await faceEl(), voice = await voiceP;
     if (!alive || !playing) return;
     pipMood(pip, 'dance');
-    const a = ac(), beat = 60 / song.bpm, ms = at => (at - a.currentTime) * 1000;
-    let t = a.currentTime + 0.3, barPos = 0;
-    // count-in: one bar of shaker clicks so everyone feels the beat
-    for (let k = 0; k < song.meter; k++) { nodes.push(...shaker(t, k === 0 ? 0.09 : 0.06), ...pluck(t, k === 0 ? 1568 : 1175, 0.08, 0.06)); t += beat; }
-    lines.forEach((line, li) => {
-      const lineStart = t;
-      later(() => {
-        lyric.innerHTML = '';
-        line.notes.forEach(n => {
-          if (n.tok === '~') return;
-          n.span = h('span', { class: 'syl' + (n.tok.endsWith('-') ? ' join' : '') }, n.tok.replace('{name}', herName()).replace(/-$/, ''));
-          lyric.append(n.span);
-        });
+    const a = ac(), ms = at => (at - a.currentTime) * 1000;
+    // with a family recording, the tune is just a soft guide under their voice
+    const plan = scheduleSong(song, a.currentTime + 0.3, { melody: voice ? 0.05 : 0.2, voice });
+    nodes = plan.nodes;
+    for (const c of plan.cues) {
+      if (!c.note) later(() => {
+        showLyric(lyric, c.line);
         scene.innerHTML = '';
-        for (const part of line.pic.split(/(FACE)/).filter(Boolean)) scene.append(part === 'FACE' ? face.cloneNode(true) : h('span', {}, part));
-        scene.className = 'song-scene ' + song.id + ' l' + li;
+        for (const part of c.line.pic.split(/(FACE)/).filter(Boolean)) scene.append(part === 'FACE' ? face.cloneNode(true) : h('span', {}, part));
+        scene.className = 'song-scene ' + song.id + ' l' + c.li;
         scene.classList.remove('pop'); void scene.offsetWidth; scene.classList.add('pop');
-        if (line.sound) { pipMood(pip, 'happy', 1500); tts(line.sound + '!'); }
-      }, ms(lineStart) - 80);
-      // the band
-      let ct = lineStart, cb = barPos;
-      for (const c of line.chords) { nodes.push(...backing(ct, c.nm, c.beats, beat, song.meter, cb)); ct += c.beats * beat; cb = (cb + c.beats) % song.meter; }
-      // the tune, with the words lighting up in time
-      let lastSpan = null;
-      line.notes.forEach(n => {
-        const dur = n.beats * beat, at = t;
-        if (n.hz) nodes.push(...bell(at, n.hz, dur));
-        later(() => {
-          const sp = n.span || lastSpan; if (n.span) lastSpan = n.span;
-          lyric.querySelectorAll('.syl.on').forEach(x => x.classList.remove('on'));
-          if (sp) sp.classList.add('on');
-          if (n.hz && !line.sound) voiceUntil = Date.now() + dur * 850; // Pip sings each note
-          if (ear.level > 0.06 && Math.random() < 0.5) sparkle();
-        }, ms(at));
-        t += dur;
-      });
-      for (let b = lineStart; b < t - 0.01; b += beat / 2) nodes.push(...shaker(b, Math.abs(((b - lineStart) / beat) % 1) < 0.01 ? 0.045 : 0.025));
-      barPos = (barPos + Math.round((t - lineStart) / beat)) % song.meter;
-    });
+        if (c.line.sound) { pipMood(pip, 'happy', 1500); if (!voice) tts(c.line.sound + '!'); }
+      }, ms(c.at) - 80);
+      else later(() => {
+        lightLyric(lyric, c.note);
+        if (c.note.hz && !c.line.sound) voiceUntil = Date.now() + c.dur * 850; // Pip sings each note
+        if (ear.level > 0.06 && Math.random() < 0.5) sparkle();
+      }, ms(c.at));
+    }
     later(async () => {
       playing = false; lyric.innerHTML = ''; pipMood(pip, 'happy', 2500); sfx.tada(); confetti(80);
       await tts(pick(['Lovely singing!', 'Yay!', 'Well done!']));
       setTimeout(() => alive && !playing && picker(), 1200);
-    }, ms(t) + 300);
+    }, ms(plan.end) + 300);
   }
   function key() {
     if (playing) { nodes.push(...bell(ac().currentTime, pick(PENTA), 0.4, 0.12)); sparkle(); return; } // she plays along
@@ -1384,7 +1591,7 @@ function photoPicker(onBlob) {
   return inp;
 }
 function allBlobIds() {
-  const ids = [S.photo, ...S.nameRec, ...S.bdayRec, ...S.herClips.map(c => c.id)];
+  const ids = [S.photo, ...S.nameRec, ...S.bdayRec, ...S.herClips.map(c => c.id), ...Object.values(S.songRec).map(r => r.id)];
   for (const w of S.words) { ids.push(w.photo); for (const r of w.rec.en) ids.push(r.id); }
   return ids.filter(Boolean);
 }
@@ -1417,6 +1624,59 @@ SCREENS.grown = () => {
             S.words = S.words.filter(x => x !== w); await save(); rerender();
           } }, '🗑')),
         recs));
+  }
+
+  // ----- singing the songs in a family voice -----
+  let active = null; // the song playing or recording right now
+  const stopActive = () => { if (active) { const x = active; active = null; x.stop(); } };
+  function playAlong(song, opts, lyric) {
+    const a = ac(), plan = scheduleSong(song, a.currentTime + 0.8, opts), timers = [];
+    const at = (t, fn) => timers.push(setTimeout(fn, Math.max(0, (t - a.currentTime) * 1000)));
+    for (const c of plan.cues) at(c.at - (c.note ? 0 : 0.08), () => c.note ? lightLyric(lyric, c.note) : showLyric(lyric, c.line));
+    return { plan, stop() { timers.forEach(clearTimeout); for (const n of plan.nodes) { try { n.stop(); } catch (e) {} } } };
+  }
+  async function recordSong(song) {
+    stopActive(); stopSound();
+    let st;
+    try { st = await getMic(); } catch (e) { return alert('The microphone is blocked. Allow the microphone for this site, then try again.'); }
+    const a = ac(); if (a.state !== 'running') await a.resume().catch(() => {});
+    const lyric = h('div', { class: 'lyric' }), status = h('p', { class: 'inst-why' }, 'Get ready… Sing along when the words light up. Hold the device close.');
+    const cancelBtn = h('button', { class: 'inst-x sing-cancel' }, '✕ Cancel');
+    const box = h('div', { class: 'inst-modal' }, h('div', { class: 'inst-card sing-card' },
+      h('h2', {}, h('span', { class: 'rec-dot' }), ` ${song.title.replace('{name}', herName())}`), status, lyric, h('div', { class: 'row', style: 'margin-top:14px' }, cancelBtn)));
+    document.body.append(box);
+    const mime = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+    const rec = new MediaRecorder(st, mime ? { mimeType: mime } : undefined), chunks = [];
+    rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    const done = new Promise(r => { rec.onstop = () => r(new Blob(chunks, { type: rec.mimeType || mime || 'audio/webm' })); });
+    await new Promise(r => { rec.onstart = r; rec.start(); setTimeout(r, 1000); });
+    const recAt = a.currentTime, run = playAlong(song, { melody: 0.15 }, lyric);
+    // where the count-in lands in the recording: the delay to the song, plus the time sound takes to reach the speaker and come back
+    const offset = (run.plan.cues[0].at - song.meter * 60 / song.bpm) - recAt + (a.outputLatency || a.baseLatency || 0.02) + 0.03;
+    let finished = false;
+    const finish = async keep => {
+      if (finished) return; finished = true; active = null;
+      run.stop(); clearTimeout(endT); if (rec.state !== 'inactive') rec.stop();
+      const blob = await done; box.remove();
+      if (!keep || !blob.size) return;
+      const id = uid(); await blobSet(id, blob);
+      const old = S.songRec[song.id]; if (old) await blobDel(old.id);
+      S.songRec[song.id] = { id, offset }; await save(); rerender();
+    };
+    const endT = setTimeout(() => finish(true), (run.plan.end - a.currentTime + 1) * 1000);
+    cancelBtn.onclick = () => finish(false);
+    active = { stop: () => finish(false) };
+  }
+  async function previewSong(song, btn) {
+    const was = active && active.song === song.id; stopActive();
+    if (was) return;
+    const voice = await songVoice(song.id); if (!voice) return;
+    const lyric = h('div', { class: 'lyric small' }); btn.after(lyric);
+    const run = playAlong(song, { melody: 0.05, voice }, lyric);
+    btn.textContent = '■ Stop';
+    const end = () => { run.stop(); lyric.remove(); btn.textContent = '▶ Hear it'; clearTimeout(t); };
+    const t = setTimeout(() => { if (active && active.song === song.id) active = null; end(); }, (run.plan.end - ac().currentTime + 0.5) * 1000);
+    active = { song: song.id, stop: end };
   }
 
   async function testMic(btn) {
@@ -1461,11 +1721,37 @@ SCREENS.grown = () => {
         h('label', {}, 'Date of birth (for the birthday countdown and birthday mode)'),
         h('input', { type: 'date', value: S.birthday, onchange: async e => { S.birthday = e.target.value; await save(); } })),
 
+      h('section', {}, h('h2', {}, '🧸 Games on the home screen'),
+        h('p', { class: 'sub' }, "Little mode shows just a few games, so she isn't faced with too many choices. Tick the games you want her to see. Family peekaboo appears once you add photos."),
+        h('div', { class: 'row', style: 'margin-bottom:10px' },
+          h('button', { onclick: async () => { S.show = LITTLE.slice(); await save(); rerender(); } }, '🐣 Little mode'),
+          h('button', { onclick: async () => { S.show = GAMES.map(g => g[0]); await save(); rerender(); } }, '🌈 All games')),
+        h('div', { class: 'game-picks' }, GAMES.map(([id, ic, label]) => h('label', { class: 'game-pick' },
+          h('input', { type: 'checkbox', checked: S.show.includes(id), onchange: async e => {
+            S.show = e.target.checked ? [...new Set([...S.show, id])] : S.show.filter(x => x !== id); await save();
+          } }), ` ${ic === 'pip' ? '🐥' : ic} ${label}`)))),
+
+      h('section', {}, h('h2', {}, '🎵 Sing the songs yourself'),
+        h('p', { class: 'sub' }, "Press Record and sing along with the music while the words light up. Then the song plays with your voice instead of Pip's tune. It's fine to sing badly. She loves your voice most!"),
+        SONGS.map(song => {
+          const has = S.songRec[song.id];
+          const hear = h('button', {}, '▶ Hear it'); hear.onclick = () => previewSong(song, hear);
+          return h('div', { class: 'song-rec-row' },
+            h('div', { class: 'song-rec-title' }, `${song.icon} ${song.title.replace('{name}', herName())}`),
+            h('div', { class: 'row' },
+              h('button', { class: has ? '' : 'primary', onclick: () => recordSong(song) }, has ? '🎙 Sing it again' : '🎙 Record'),
+              has ? hear : null,
+              has ? h('button', { title: 'Delete', onclick: async () => {
+                if (!confirm('Delete your singing for this song?')) return;
+                stopActive(); await blobDel(has.id); delete S.songRec[song.id]; await save(); rerender();
+              } }, '🗑') : null));
+        })),
+
       h('section', {}, h('h2', {}, '🐥 Pip listens to her'),
         h('p', { class: 'sub' }, "Pip asks her to say words and cheers when she makes any sound. At her age every try counts, so Pip doesn't check if the word is right. Test the microphone once and press Allow if the browser asks."),
         h('label', { style: 'display:flex;gap:8px;align-items:center;font-weight:400' },
           h('input', { type: 'checkbox', checked: S.listen, onchange: async e => { S.listen = e.target.checked; await save(); } }),
-          'Let Pip listen (Talk with Pip, Copy me, Peekaboo, My Words, Bubbles and Birthday)'),
+          'Let Pip listen (Talk with Pip, Peekaboo, My body, Feed the animals, My Words and more)'),
         h('div', { class: 'row', style: 'margin-top:8px' }, micBtn)),
 
       h('section', {}, h('h2', {}, '🎤 Her voice'),
@@ -1480,7 +1766,7 @@ SCREENS.grown = () => {
         } }, '🗑 Delete all') : null),
 
       h('section', {}, h('h2', {}, 'Her words and pictures'),
-        h('p', { class: 'sub' }, "These show up in all the games. Tap a picture to use your own photo, like Gogo's face or her real cup. Animals make their sound too (Duck says \"Quack quack\"). Recording a word in your voice is optional."),
+        h('p', { class: 'sub' }, "These show up in all the games. Tap a picture to use your own photo, like Gogo's face or her real cup. Words with a photo also play in Family peekaboo. Animals make their sound too (Duck says \"Quack quack\"). Recording a word in your voice is optional."),
         h('div', { class: 'row', style: 'margin:12px 0' }, h('button', { class: 'primary', onclick: async () => {
           S.words.unshift({ id: uid(), en: '', emoji: '⭐', photo: null, rec: { en: [] } }); await save(); await rerender();
           const first = el.querySelector('.wordrow input'); if (first) first.focus();
@@ -1548,7 +1834,7 @@ SCREENS.grown = () => {
   }
 
   render();
-  return { el };
+  return { el, cleanup() { stopActive(); } };
 };
 
 // ---------------- start ----------------
@@ -1567,7 +1853,7 @@ async function smoke() {
   const out = [];
   window.addEventListener('error', e => out.push('ERR ' + e.message));
   window.addEventListener('unhandledrejection', e => out.push('REJ ' + (e.reason && e.reason.message)));
-  for (const s of ['grown', 'splash', 'home', 'talk', 'copy', 'peekaboo', 'hiding', 'words', 'colours', 'numbers', 'songs', 'paint', 'bubbles', 'piano', 'birthday', 'goodnight']) {
+  for (const s of ['grown', 'splash', 'home', 'talk', 'copy', 'peekaboo', 'family', 'body', 'feed', 'hiding', 'words', 'colours', 'numbers', 'songs', 'paint', 'bubbles', 'piano', 'birthday', 'goodnight']) {
     try {
       go(s); await wait(400);
       for (let i = 0; i < 3; i++) { if (cur.onKey) cur.onKey({ key: 'asd'[i] }); await wait(1500); }

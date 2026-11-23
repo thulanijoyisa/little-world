@@ -45,6 +45,16 @@ const PHRASES = [
   'Woof woof!', 'Meow!', 'Moo!', 'Quack quack!', 'Tweet tweet!', 'Cluck cluck!', 'Ribbit!', 'Roar!', 'Toot toot!', 'Baa baa!',
   'Oink oink!', 'Neigh!', 'Meh meh!', 'Hoo hoo!', 'Buzz buzz!', 'Hiss!', 'Ooh ooh ah ah!', 'Squeak squeak!', 'Beep beep!',
   'Choo choo!', 'Waa waa!',
+  // my body
+  'My body', "Where's your nose?", 'Where are your eyes?', 'Where are your ears?', "Where's your mouth?", "Where's your tummy?",
+  'Where are your hands?', 'Where are your toes?', 'Nose!', 'Eyes!', 'Ears!', 'Mouth!', 'Tummy!', 'Hands!', 'Toes!',
+  'Touch your nose!', 'Touch your eyes!', 'Touch your ears!', 'Touch your mouth!', 'Pat your tummy!', 'Clap your hands!',
+  'Wiggle your toes!', 'Boop!', "Teddy's",
+  // feed the animals
+  'Feed the animals', 'Feed the', 'is hungry!', "Who's hungry?", 'Yum!', 'Yum yum!', 'No thank you!', 'All full!',
+  'Monkey!', 'Bunny!', 'Mouse!', 'Bear!', 'Grr!', 'Bone!', 'Cheese!', 'Honey!', 'Grass!',
+  // family peekaboo
+  'Family peekaboo',
 ];
 const norm = s => s.toLowerCase().replace(/’/g, "'").replace(/[^a-z0-9' ]+/g, ' ').replace(/\s+/g, ' ').trim();
 const slug = s => norm(s).replace(/'/g, '').replace(/ /g, '-');

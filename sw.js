@@ -1,6 +1,6 @@
 // Keeps Little World working offline. Always tries the network first so updates arrive,
 // and falls back to the saved copy when there's no internet.
-const CACHE = 'little-world-v16';
+const CACHE = 'little-world-v17';
 const FILES = ['./', 'index.html', 'app.js', 'style.css', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 // Pip's default voice clips are saved too, so she can play with the internet off.
 async function saveAll() {
