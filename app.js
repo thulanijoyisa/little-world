@@ -540,7 +540,7 @@ SCREENS.splash = () => {
 };
 
 SCREENS.home = (greet) => {
-  const games = [['talk', 'pip', 'Talk with Pip'], ['copy', '🦜', 'Copy me!'], ['peekaboo', '🙈', 'Peekaboo'], ['hiding', '🌳', "Who's hiding?"],
+  const games = [['talk', 'pip', 'Talk with Pip'], ['songs', '🎵', 'Songs'], ['copy', '🦜', 'Copy me!'], ['peekaboo', '🙈', 'Peekaboo'], ['hiding', '🌳', "Who's hiding?"],
     ['words', '🗣️', 'My Words'], ['numbers', '🔢', 'Counting'], ['paint', '🎨', 'Paint'], ['bubbles', '🫧', 'Bubbles'], ['piano', '🐮', 'Animals']];
   const bi = bdayInfo();
   if (bi && bi.days <= 30) games.unshift(['birthday', '🎂', bi.isToday ? 'Birthday!' : 'Birthday']);
@@ -815,6 +815,159 @@ SCREENS.numbers = () => {
   (async () => { await wait(300); if (alive) await tts(`Let's count ${theme[2]}! Tap!`); })();
   el.addEventListener('pointerdown', e => { sparkle(e.clientX, e.clientY); add(); });
   return { el, onKey: () => { sparkle(); add(); }, cleanup() { alive = false; } };
+};
+
+// ---------------- songs ----------------
+// Traditional nursery songs (public domain). Each line: words | notes (name:beats) | picture.
+// "word-" joins to the next syllable; "{name}" is her name; "~" holds the previous word over another note.
+const NOTE_I = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+const noteHz = n => { const m = /^([A-G])([#b]?)(\d)$/.exec(n); const midi = 12 * (+m[3] + 1) + NOTE_I[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0); return 440 * 2 ** ((midi - 69) / 12); };
+const MAC_ANIMALS = [['cow', 'moo', '🐄'], ['duck', 'quack', '🦆'], ['dog', 'woof', '🐶']];
+const SONGS = [
+  { id: 'twinkle', title: 'Twinkle Twinkle', say: 'Twinkle Twinkle', icon: '⭐', bpm: 96, lines: [
+    'Twin- kle twin- kle lit- tle star,|C4 C4 G4 G4 A4 A4 G4:2|⭐',
+    'How I won- der what you are!|F4 F4 E4 E4 D4 D4 C4:2|✨',
+    'Up a- bove the world so high,|G4 G4 F4 F4 E4 E4 D4:2|🌙',
+    'Like a dia- mond in the sky!|G4 G4 F4 F4 E4 E4 D4:2|💎',
+    'Twin- kle twin- kle lit- tle star,|C4 C4 G4 G4 A4 A4 G4:2|⭐',
+    'How I won- der what you are!|F4 F4 E4 E4 D4 D4 C4:2|✨'] },
+  { id: 'mac', title: 'Old MacDonald', say: 'Old MacDonald', icon: '🐄', bpm: 120, lines: MAC_ANIMALS.flatMap(([a, s, pic]) => [
+    'Old Mac- Don- ald had a farm,|G4 G4 G4 D4 E4 E4 D4:2|👨‍🌾',
+    'E- I- E- I- O!|B4 B4 A4 A4 G4:3|👨‍🌾',
+    `And on his farm he had a ${a},|D4 G4 G4 G4 D4 E4 E4 D4:2|${pic}`,
+    `E- I- E- I- O!|B4 B4 A4 A4 G4:3|${pic}|${s}`,
+    `With a ${s} ${s} here,|D4:0.5 D4:0.5 G4 G4 G4:2|${pic}`,
+    `And a ${s} ${s} there,|D4:0.5 D4:0.5 G4 G4 G4:2|${pic}`,
+    `Here a ${s}, there a ${s}, ev- ery- where a ${s} ${s}!|G4:0.5 G4:0.5 G4 G4:0.5 G4:0.5 G4 G4:0.5 G4:0.5 G4:0.5 G4:0.5 G4 G4|${pic}`,
+    'Old Mac- Don- ald had a farm,|G4 G4 G4 D4 E4 E4 D4:2|👨‍🌾',
+    `E- I- E- I- O!|B4 B4 A4 A4 G4:3|${pic}|${s}`]) },
+  { id: 'spider', title: 'Itsy Bitsy Spider', say: 'Itsy Bitsy Spider', icon: '🕷️', bpm: 112, lines: [
+    'The it- sy bit- sy spi- der climbed up the wa- ter spout.|G4:0.5 C5 C5:0.5 C5 D5:0.5 E5 E5:0.5 E5 D5:0.5 C5 D5:0.5 E5 C5:2|🕷️⬆️',
+    'Down came the rain and washed the spi- der out!|E5:1.5 E5:0.5 F5 G5:2 G5 F5:0.5 E5 F5:0.5 G5 E5:2|🌧️',
+    'Out came the sun and dried up all the rain,|C5:1.5 C5:0.5 D5 E5:2 E5 D5:0.5 C5 D5:0.5 E5 C5:2|☀️',
+    'And the it- sy bit- sy spi- der climbed up the spout a- gain!|G4:0.5 G4:0.5 C5 C5:0.5 C5 D5:0.5 E5 E5:0.5 E5 D5:0.5 C5 D5:0.5 E5 C5:2|🕷️⬆️'] },
+  { id: 'boat', title: 'Row Your Boat', say: 'Row Your Boat', icon: '🚣', bpm: 100, lines: [
+    'Row, row, row your boat,|C4:1.5 C4:1.5 C4 D4:0.5 E4:1.5|🚣',
+    'Gent- ly down the stream.|E4 D4:0.5 E4 F4:0.5 G4:3|🌊',
+    'Mer- ri- ly mer- ri- ly mer- ri- ly mer- ri- ly,|C5:0.5 C5:0.5 C5:0.5 G4:0.5 G4:0.5 G4:0.5 E4:0.5 E4:0.5 E4:0.5 C4:0.5 C4:0.5 C4:0.5|😄',
+    'Life is but a dream!|G4 F4:0.5 E4 D4:0.5 C4:3|💤'] },
+  { id: 'where', title: 'Where is {name}?', say: '', icon: '🙈', bpm: 100, name: true, lines: [
+    'Where is {name} ~ Where is {name} ~|C4 D4 E4 C4 C4 D4 E4 C4|🙈',
+    'Here you are! Here you are!|E4 F4 G4:2 E4 F4 G4:2|FACE',
+    'How are you to- day, {name}?|G4:0.5 A4:0.5 G4:0.5 F4:0.5 E4 C4|FACE',
+    'Ve- ry well, I thank you!|G4:0.5 A4:0.5 G4:0.5 F4:0.5 E4 C4|😊',
+    'Peek- a- boo! Peek- a- boo!|C4 G3 C4:2 C4 G3 C4:2|🙈FACE'] },
+  { id: 'bday', title: 'Happy Birthday', say: 'Happy birthday', icon: '🎂', bpm: 104, name: true, lines: [
+    'Hap- py birth- day to you,|G4:0.75 G4:0.25 A4 G4 C5 B4:2|🎂',
+    'Hap- py birth- day to you,|G4:0.75 G4:0.25 A4 G4 D5 C5:2|🎈',
+    'Hap- py birth- day dear {name} ~|G4:0.75 G4:0.25 G5 E5 C5 B4 A4:2|FACE',
+    'Hap- py birth- day to you!|F5:0.75 F5:0.25 E5 C5 D5 C5:2|🎉'] },
+];
+function parseLine(str) {
+  const [words, notes, pic, sound] = str.split('|');
+  const toks = words.split(' '), ns = notes.split(' ');
+  if (toks.length !== ns.length) console.warn('song line mismatch', words);
+  return { pic, sound, notes: ns.map((n, i) => { const [nm, b] = n.split(':'); return { hz: noteHz(nm), beats: b ? +b : 1, tok: toks[i] || '~' }; }) };
+}
+// A soft music-box sound for each note, plus a gentle shaker on the beat.
+function bell(t, hz, dur, vol = 0.2) {
+  const a = ac(), g = a.createGain(), o1 = a.createOscillator(), o2 = a.createOscillator(), g2 = a.createGain();
+  o1.type = 'triangle'; o1.frequency.value = hz; o2.type = 'sine'; o2.frequency.value = hz * 2; g2.gain.value = 0.25;
+  g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(vol, t + 0.015); g.gain.exponentialRampToValueAtTime(0.001, t + Math.max(0.3, dur * 0.95));
+  o1.connect(g); o2.connect(g2).connect(g); g.connect(a.destination);
+  o1.start(t); o2.start(t); o1.stop(t + dur + 0.1); o2.stop(t + dur + 0.1);
+  return [o1, o2];
+}
+let noiseBuf = null;
+function shaker(t, vol = 0.05) {
+  const a = ac();
+  if (!noiseBuf) { noiseBuf = a.createBuffer(1, a.sampleRate * 0.08, a.sampleRate); const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length); }
+  const s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
+  s.buffer = noiseBuf; f.type = 'highpass'; f.frequency.value = 5000; g.gain.value = vol;
+  s.connect(f).connect(g).connect(a.destination); s.start(t);
+  return [s];
+}
+const PENTA = ['C5', 'D5', 'E5', 'G5', 'A5', 'C6'].map(noteHz);
+
+SCREENS.songs = () => {
+  const pip = pipEl('side'), stage = h('div', { class: 'song-stage' });
+  const el = h('div', { class: 'screen songs' }, sky(), homeBtn(), stage, pip);
+  let alive = true, playing = false, nodes = [], timers = [], nextIdx = 0, sel = -1;
+  const list = () => SONGS.filter(s => s.id !== 'bday' || (bdayInfo() && bdayInfo().days <= 30));
+  function stopSong() { for (const n of nodes) { try { n.stop(); } catch (e) {} } nodes = []; timers.forEach(clearTimeout); timers = []; playing = false; }
+  function picker() {
+    stopSong(); pipMood(pip, null); sel = -1;
+    const songs = list();
+    stage.innerHTML = '';
+    stage.append(h('div', { class: 'song-grid' }, songs.map((s, i) => h('button', {
+      class: 'song-card', style: `background:${COLORS[(i + 2) % COLORS.length]}`,
+      onpointerdown: e => { e.stopPropagation(); play(s); },
+    }, h('span', { class: 'ic' }, s.icon), s.title.replace('{name}', herName())))));
+  }
+  async function play(song) {
+    stopSong(); playing = true; nextIdx = list().indexOf(song) + 1;
+    const lines = song.lines.map(parseLine);
+    const scene = h('div', { class: 'song-scene' }), lyric = h('div', { class: 'lyric' });
+    stage.innerHTML = ''; stage.append(scene, lyric);
+    pipMood(pip, 'wave', 1500);
+    if (song.name) { await tts("Let's sing!"); if (!alive || !playing) return; await sayName(); }
+    else await tts(`Let's sing! ${song.say}!`);
+    if (!alive || !playing) return;
+    pipMood(pip, 'dance');
+    const face = await faceEl(); if (!alive || !playing) return;
+    const a = ac(), beat = 60 / song.bpm;
+    let t = a.currentTime + 0.4;
+    lines.forEach((line, li) => {
+      const lineStart = t;
+      // show the line's words and picture as it starts
+      timers.push(setTimeout(() => {
+        if (!alive) return;
+        lyric.innerHTML = '';
+        line.notes.forEach(n => {
+          if (n.tok === '~') return;
+          const txt = n.tok.replace('{name}', herName()).replace(/-$/, '');
+          n.span = h('span', { class: 'syl' + (n.tok.endsWith('-') ? ' join' : '') }, txt);
+          lyric.append(n.span);
+        });
+        scene.innerHTML = '';
+        for (const part of line.pic.split(/(FACE)/).filter(Boolean)) scene.append(part === 'FACE' ? face.cloneNode(true) : h('span', {}, part));
+        scene.className = 'song-scene ' + song.id + ' l' + li;
+        scene.classList.remove('pop'); void scene.offsetWidth; scene.classList.add('pop');
+      }, (lineStart - a.currentTime) * 1000 - 60));
+      line.notes.forEach(n => {
+        const dur = n.beats * beat, at = t;
+        nodes.push(...bell(at, n.hz, dur));
+        timers.push(setTimeout(() => {
+          if (!alive) return;
+          voiceUntil = Date.now() + dur * 850; // Pip "sings" each note
+          const sp = n.span || line.notes.slice(0, line.notes.indexOf(n)).reverse().find(x => x.span)?.span;
+          lyric.querySelectorAll('.syl.on').forEach(x => x.classList.remove('on'));
+          if (sp) sp.classList.add('on');
+          if (ear.level > 0.06 && Math.random() < 0.5) sparkle();
+        }, (at - a.currentTime) * 1000));
+        t += dur;
+      });
+      for (let b = lineStart; b < t - 0.01; b += beat) nodes.push(...shaker(b));
+      if (line.sound) { const at = t; timers.push(setTimeout(() => alive && tts(line.sound[0].toUpperCase() + line.sound.slice(1) + ' ' + line.sound + '!'), (at - a.currentTime) * 1000)); t += beat * 1.5; }
+      t += beat * 0.5; // a little breath between lines
+    });
+    timers.push(setTimeout(async () => {
+      if (!alive) return;
+      playing = false; lyric.innerHTML = ''; pipMood(pip, 'happy', 2500); sfx.tada(); confetti(80);
+      await tts(pick(['Lovely singing!', 'Yay!', 'Well done!']));
+      if (alive && !playing) setTimeout(() => alive && !playing && picker(), 1200);
+    }, (t - a.currentTime) * 1000 + 200));
+  }
+  function key() {
+    if (playing) { // she plays along with bells
+      const hz = pick(PENTA); nodes.push(...bell(ac().currentTime, hz, 0.4, 0.12)); sparkle(); return;
+    }
+    const songs = list(); play(songs[nextIdx % songs.length]);
+  }
+  picker();
+  (async () => { await wait(300); if (alive && !playing) await tts("Let's sing!"); })();
+  el.addEventListener('pointerdown', () => { if (playing) key(); });
+  return { el, onKey: key, cleanup() { alive = false; stopSong(); } };
 };
 
 SCREENS.paint = () => {
@@ -1175,7 +1328,7 @@ async function smoke() {
   const out = [];
   window.addEventListener('error', e => out.push('ERR ' + e.message));
   window.addEventListener('unhandledrejection', e => out.push('REJ ' + (e.reason && e.reason.message)));
-  for (const s of ['grown', 'splash', 'home', 'talk', 'copy', 'peekaboo', 'hiding', 'words', 'numbers', 'paint', 'bubbles', 'piano', 'birthday', 'goodnight']) {
+  for (const s of ['grown', 'splash', 'home', 'talk', 'copy', 'peekaboo', 'hiding', 'words', 'numbers', 'songs', 'paint', 'bubbles', 'piano', 'birthday', 'goodnight']) {
     try {
       go(s); await wait(400);
       for (let i = 0; i < 3; i++) { if (cur.onKey) cur.onKey({ key: 'asd'[i] }); await wait(1500); }
