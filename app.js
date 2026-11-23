@@ -550,6 +550,81 @@ function bdayInfo() {
   return { days, age: next.getFullYear() - b.getFullYear(), isToday: days === 0 };
 }
 
+// ---------------- install on this device ----------------
+// Android and desktop Chrome/Edge offer a real install prompt; iPhone/iPad need a few taps in Safari,
+// so for those we show the steps. Nothing shows once the app is already installed.
+let installEvt = null;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; refreshInstall(); });
+window.addEventListener('appinstalled', () => { installEvt = null; refreshInstall(); });
+const isInstalled = () => matchMedia('(display-mode: standalone)').matches || matchMedia('(display-mode: fullscreen)').matches || navigator.standalone === true;
+function devicePlatform() {
+  const ua = navigator.userAgent;
+  // iPads (and Chrome on iPad) often pretend to be a Mac; a Mac has no touch screen, and Chrome/Firefox leave their own marks.
+  const iPad = /iPad/.test(ua) || (/Macintosh/.test(ua) && (navigator.maxTouchPoints > 1 || 'ontouchend' in document));
+  const browser = /CriOS/.test(ua) || window.__gCrWeb ? 'chrome' : /FxiOS/.test(ua) || window.__firefox__ ? 'firefox' : /EdgiOS/.test(ua) ? 'edge' : 'safari';
+  if (iPad || /iPhone|iPod/.test(ua)) return { os: iPad ? 'ipad' : 'iphone', browser };
+  if (/Android/.test(ua)) return { os: 'android' };
+  if (/Macintosh/.test(ua) && /Safari/.test(ua) && !/Chrome|Chromium|Edg|Firefox/.test(ua)) return { os: 'mac-safari' };
+  return { os: 'desktop' };
+}
+const canInstall = () => !isInstalled() && (!!installEvt || ['iphone', 'ipad', 'mac-safari', 'android'].includes(devicePlatform().os));
+function refreshInstall() { document.querySelectorAll('[data-install]').forEach(x => x.classList.toggle('hidden', !canInstall())); }
+const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+async function doInstall() {
+  if (installEvt) {
+    const e = installEvt; installEvt = null;
+    try { e.prompt(); await e.userChoice; } catch (err) {}
+    refreshInstall(); return;
+  }
+  showInstallHelp();
+}
+const SHARE_ICON = '<svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M12 3v12M7.5 7.5 12 3l4.5 4.5" fill="none" stroke="#1c7ed6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 10H6a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-2" fill="none" stroke="#1c7ed6" stroke-width="2" stroke-linecap="round"/></svg>';
+const ADD_ICON = '<svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="4" fill="none" stroke="#212529" stroke-width="2"/><path d="M12 8v8M8 12h8" stroke="#212529" stroke-width="2" stroke-linecap="round"/></svg>';
+function showInstallHelp() {
+  const p = devicePlatform(), ic = html => { const s = h('span', { class: 'inst-ic' }); s.innerHTML = html; return s; };
+  let title = 'Install Little World', steps;
+  if (p.os === 'iphone' || p.os === 'ipad') {
+    if (p.browser === 'safari') steps = [
+      [ic(SHARE_ICON), `Tap the Share button ${p.os === 'ipad' ? 'at the top, next to the address bar' : 'at the bottom of the screen'}.`],
+      [ic(ADD_ICON), 'Scroll down and tap "Add to Home Screen".'],
+      ['✅', 'Tap "Add" in the top corner. Then open Little World from your home screen.']];
+    else steps = [
+      [ic(SHARE_ICON), p.browser === 'chrome' ? 'Tap the Share button at the top right, next to the address bar.' : 'Open the browser menu and tap Share.'],
+      [ic(ADD_ICON), 'Scroll down and tap "Add to Home Screen". (Not there? Update the iPad/iPhone, or open this page in Safari and do it there.)'],
+      ['✅', 'Tap "Add". Then open Little World from your home screen and set it up there (the installed app keeps its own photos and voices).']];
+  } else if (p.os === 'android') steps = [
+    ['⋮', 'Tap the menu (three dots) in the top corner of the browser.'],
+    [ic(ADD_ICON), 'Tap "Install app" or "Add to Home screen".'],
+    ['✅', 'Tap "Install". Then open Little World from your home screen.']];
+  else if (p.os === 'mac-safari') steps = [
+    ['🍎', 'In the menu bar at the top, click File.'],
+    [ic(ADD_ICON), 'Click "Add to Dock", then "Add".'],
+    ['✅', 'Open Little World from the Dock.']];
+  else steps = [
+    ['⬇️', 'Look for the install icon at the right of the address bar, or open the browser menu.'],
+    [ic(ADD_ICON), 'Choose "Install Little World" (or "Apps → Install this site as an app").'],
+    ['✅', 'Open Little World from your apps.']];
+  const box = h('div', { class: 'inst-modal', role: 'dialog', 'aria-label': title },
+    h('div', { class: 'inst-card' },
+      h('h2', {}, '📲 ' + title),
+      h('p', { class: 'inst-why' }, 'It opens full screen like a real app, works without internet, and is easy for little hands to find.'),
+      h('ol', {}, steps.map(([icon, text]) => h('li', {}, typeof icon === 'string' ? h('span', { class: 'inst-ic' }, icon) : icon, h('span', {}, text)))),
+      h('button', { class: 'inst-ok', onclick: () => box.remove() }, 'Got it')));
+  for (const ev of ['pointerdown', 'click']) box.addEventListener(ev, e => { e.stopPropagation(); if (e.target === box && ev === 'click') box.remove(); });
+  document.body.append(box);
+}
+// A small banner for grown-ups on the start screen; closing it hides it for two weeks.
+function installBanner() {
+  const last = +(store.get('lw-install-later') || 0);
+  if (Date.now() - last < 14 * 864e5) return null;
+  const stop = e => e.stopPropagation();
+  const b = h('div', { class: 'inst-banner', 'data-install': '', onpointerdown: stop, onclick: stop },
+    h('button', { class: 'inst-go', onclick: e => { e.stopPropagation(); doInstall(); } }, '📲 Install the app'),
+    h('button', { class: 'inst-x', 'aria-label': 'Not now', onclick: e => { e.stopPropagation(); store.set('lw-install-later', String(Date.now())); b.remove(); } }, '✕'));
+  if (!canInstall()) b.classList.add('hidden');
+  return b;
+}
+
 // ---------------- screen manager ----------------
 let screenGen = 0;
 // Runs spoken steps one after another, stopping if the screen changes (so old speech can't talk over a new game).
@@ -600,7 +675,7 @@ SCREENS.splash = () => {
   const el = h('div', { class: 'screen splash' }, sky(), h('div', {}, '…'));
   (async () => {
     el.lastChild.remove();
-    el.append(await faceEl(), h('h1', {}, `${S.name ? S.name + "'s" : 'Little'} World`), h('p', {}, 'Press any key or tap to play'));
+    el.append(await faceEl(), h('h1', {}, `${S.name ? S.name + "'s" : 'Little'} World`), h('p', {}, 'Press any key or tap to play'), installBanner());
   })();
   let started = false;
   const start = async () => {
@@ -1369,6 +1444,9 @@ SCREENS.grown = () => {
     el.append(h('div', { class: 'wrap' },
       h('h1', {}, '🔒 Grown-up corner'),
       h('p', { class: 'sub' }, 'Everything you add stays on this device only. Nothing is uploaded. To come back here, hold the 🔒 in the top corner for 3 seconds.'),
+      isInstalled() ? null : h('section', { class: 'install-sec' }, h('h2', {}, '📲 Install on this device'),
+        h('p', { class: 'sub' }, 'Put Little World on the home screen so it opens full screen like a real app and works without internet.'),
+        h('button', { class: 'primary', onclick: doInstall }, installEvt ? '📲 Install now' : '📲 Show me how')),
       !S.setupDone ? h('section', { class: 'welcome' }, h('h2', {}, 'Welcome! 🎉'),
         h('p', { class: 'sub' }, "Add her name, her photo and a few family photos, then test the microphone so Pip can hear her. You can skip anything and add more later.")) : null,
 
