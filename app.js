@@ -93,14 +93,15 @@ function defaults() {
   return {
     name: '', photo: null, birthday: '', nameRec: [], bdayRec: [], minutes: 15, listen: true, voice: '',
     words: STARTER.map(([en, emoji]) => ({ id: uid(), en, emoji, photo: null, rec: { en: [] } })),
-    herClips: [], keepVoice: true, countTo: 5, pipVoice: 'matilda', setupDone: false, show: LITTLE.slice(), songRec: {},
+    herClips: [], keepVoice: true, countTo: 5, pipVoice: 'matilda', setupDone: false, show: GAMES.map(g => g[0]), showV: 2, songRec: {},
   };
 }
 // Older saves had isiZulu fields; keep only what the English app uses.
 function tidy(s) {
   s.words = (s.words || []).map(w => ({ id: w.id || uid(), en: w.en || '', emoji: w.emoji || '⭐', photo: w.photo || null, rec: { en: (w.rec && w.rec.en) || [] } }));
   s.herClips = s.herClips || [];
-  if (!Array.isArray(s.show)) s.show = LITTLE.slice();
+  // All games are shown unless the grown-ups pick Little mode (older saves defaulted to Little mode).
+  if (!Array.isArray(s.show) || s.showV !== 2) { s.show = GAMES.map(g => g[0]); s.showV = 2; }
   if (!s.songRec || typeof s.songRec !== 'object') s.songRec = {};
   for (const k of ['diary', 'gallery', 'who']) delete s[k];
   return s;
@@ -1722,7 +1723,7 @@ SCREENS.grown = () => {
         h('input', { type: 'date', value: S.birthday, onchange: async e => { S.birthday = e.target.value; await save(); } })),
 
       h('section', {}, h('h2', {}, '🧸 Games on the home screen'),
-        h('p', { class: 'sub' }, "Little mode shows just a few games, so she isn't faced with too many choices. Tick the games you want her to see. Family peekaboo appears once you add photos."),
+        h('p', { class: 'sub' }, "Tick the games you want her to see. Little mode shows just a few, so she isn't faced with too many choices. Family peekaboo appears once you add photos."),
         h('div', { class: 'row', style: 'margin-bottom:10px' },
           h('button', { onclick: async () => { S.show = LITTLE.slice(); await save(); rerender(); } }, '🐣 Little mode'),
           h('button', { onclick: async () => { S.show = GAMES.map(g => g[0]); await save(); rerender(); } }, '🌈 All games')),
